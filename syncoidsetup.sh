@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.1.3
+# syncoidsetup.sh — v0.1.4
 # Run as your NORMAL USER — the script will ask for sudo when needed.
 #
 # Usage: ./syncoidsetup.sh [--site <name>] --remote <host> [--remote <host2> ...]
@@ -16,8 +16,9 @@ ADMIN_USER="${SUDO_USER:-${USER}}"   # the actual human user, not root
 # ─────────────────────────────────────────────────────────────────────────────
 
 usage() {
-    echo "Usage: $0 [--site <name>] --remote <host> [--remote <host2> ...]"
-    echo "       --site defaults to this machine's hostname if omitted."
+    echo "Usage: $0 [--site <name>] [--remote-user <user>] --remote <host> [--remote <host2> ...]"
+    echo "       --site        defaults to this machine's hostname if omitted."
+    echo "       --remote-user SSH username on the production servers (defaults to local user)."
     exit 1
 }
 
@@ -25,17 +26,20 @@ usage() {
 
 SITE_NAME=""
 PROD_SERVERS=()
+REMOTE_ADMIN_USER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --site)   SITE_NAME="$2";       shift 2 ;;
-        --remote) PROD_SERVERS+=("$2"); shift 2 ;;
+        --site)        SITE_NAME="$2";          shift 2 ;;
+        --remote)      PROD_SERVERS+=("$2");    shift 2 ;;
+        --remote-user) REMOTE_ADMIN_USER="$2";  shift 2 ;;
         -h|--help) usage ;;
         *) echo "[ERROR] Unknown argument: $1" >&2; usage ;;
     esac
 done
 
 [[ -z "${SITE_NAME}" ]] && SITE_NAME=$(hostname -s)
+REMOTE_ADMIN_USER="${REMOTE_ADMIN_USER:-${ADMIN_USER}}"
 [[ ${#PROD_SERVERS[@]} -eq 0 ]] && { echo "[ERROR] At least one --remote <host> is required." >&2; usage; }
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -51,16 +55,19 @@ for SERVER in "${PROD_SERVERS[@]}"; do
     fi
 done
 
-# ── SSH connectivity pre-check (before any local changes) ─────────────────────
-echo "[INFO] Checking SSH connectivity to all production servers..."
+# ── TCP reachability pre-check (before any local changes) ────────────────────
+# Checks port 22 only — does not test SSH authentication.
+echo "[INFO] Checking TCP reachability of all production servers (port 22)..."
 for SERVER in "${PROD_SERVERS[@]}"; do
-    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes \
-              -o StrictHostKeyChecking=accept-new \
-              "${ADMIN_USER}@${SERVER}" true 2>/dev/null; then
-        echo "[ERROR] Cannot reach ${SERVER} as ${ADMIN_USER} — aborting before making any local changes." >&2
-        exit 1
+    if command -v nc > /dev/null 2>&1; then
+        if ! nc -z -w 5 "${SERVER}" 22 2>/dev/null; then
+            echo "[ERROR] Cannot reach ${SERVER}:22 — aborting before making any local changes." >&2
+            exit 1
+        fi
+        echo "[OK] Reachable: ${SERVER}"
+    else
+        echo "[WARN] nc not found — skipping TCP reachability check for ${SERVER}."
     fi
-    echo "[OK] Reachable: ${SERVER}"
 done
 
 KEY_PATH="${HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
@@ -167,11 +174,11 @@ fi
 # ── 5. Push public key to each production server via SSH ──────────────────────
 for HOST in "${PROD_SERVERS[@]}"; do
     echo ""
-    echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${ADMIN_USER})..."
+    echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
 
     # We SSH as the admin user — no sudo needed locally for this step.
     # The remote side uses sudo, which will prompt if the ticket isn't cached there.
-    ssh -T "${ADMIN_USER}@${HOST}" bash -s \
+    ssh -T "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << REMOTEEOF
 set -euo pipefail
@@ -309,7 +316,7 @@ for HOST in "${PROD_SERVERS[@]}"; do
 
     # Fetch remote dataset list via admin SSH (sendsyncoid key has command= restriction)
     mapfile -t REMOTE_LINES < <(
-        ssh -o BatchMode=yes -o ConnectTimeout=5 "${ADMIN_USER}@${HOST}" \
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE_ADMIN_USER}@${HOST}" \
             "sudo zfs list -H -r -o name,encryption,keystatus" 2>/dev/null || true
     )
 
