@@ -1,0 +1,28 @@
+# Claude Code
+CLAUDE.md
+
+# Zed editor
+.zed/
+
+# VSCode
+.vscode/
+.history/
+
+# Rust
+target/
+*.rs.bk
+Cargo.lock
+
+# Environment / secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor backups / swap files
+*.log
+*.swp
+*.swo
+*~
