@@ -13,7 +13,7 @@
 >
 > The authors accept no responsibility for data loss, locked-out servers, or any other damage resulting from use of this script.
 
-A script to automate SSH key-based authentication setup for [syncoid](https://github.com/jimsalterjrs/sanoid) (ZFS replication). Run it once per site and it handles key generation, local installation, and remote deployment across all your production servers.
+A script to automate SSH key-based authentication setup for [syncoid](https://github.com/jimsalterjrs/sanoid) (ZFS replication). Run it once per site and it handles key generation, local installation, and remote deployment across all your production servers. After setup it launches an interactive wizard to discover remote ZFS datasets and generate ready-to-paste `syncoid` commands.
 
 ## Prerequisites
 
@@ -53,16 +53,31 @@ The script will prompt for your sudo password once and keep the ticket alive for
 3. Detects your Tailscale IPv4 (or plain IPv6 as fallback) to add a `from="<ip>"` restriction to the authorized key (set `BACKUP_IP` manually to skip detection; Tailscale is optional)
 4. SSHs into each production server, creates `sendsyncoid` if absent, then appends the public key to its `authorized_keys`, restricted to run only `/usr/sbin/zfs`; duplicate detection uses SSH fingerprint comparison
 5. Hardens both accounts: shell set to `/usr/sbin/nologin`, password locked
-6. Prints the exact `syncoid` command to use
+6. Launches an interactive command wizard (see below)
 
-## After setup
+## Command wizard
+
+After setup, the script immediately walks you through generating `syncoid` commands:
+
+1. **Dataset selection** — lists all ZFS datasets on each remote server (fetched via your admin SSH session); select by number, range (`1-3`), comma-separated (`1,3,5`), or `a` for all
+2. **Destination** — shows local ZFS datasets as a numbered menu; default destination is `<parent>/<site-name>/<leaf>`, overridable per dataset
+3. **Encryption** — for encrypted datasets you choose raw receive (keeps encryption on the backup server, recommended) or decrypted receive
+
+The wizard is re-run every time you invoke the script — safe to run again when adding new datasets, since the setup phase skips steps that are already done (existing keys and authorized_keys entries are detected and left in place).
+
+The wizard is skipped automatically when stdin is not a terminal (e.g. cron, piped run).
+
+Example output:
 
 ```bash
 syncoid --no-privilege-elevation \
-  --sshkey=/home/recsyncoid/.ssh/id_ed25519_<site-name>_syncoid \
-  sendsyncoid@<prod-host>:pool/dataset \
-  pool/backup/<site-name>/dataset
+  --sshkey=/home/recsyncoid/.ssh/id_ed25519_homelab_syncoid \
+  --sendoptions=w \
+  sendsyncoid@192.168.1.10:tank/data \
+  backup/homelab/data
 ```
+
+`--sendoptions=w` is included automatically for encrypted datasets when raw receive is chosen.
 
 ## Security model
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.1.0
+# syncoidsetup.sh — v0.1.1
 # Run as your NORMAL USER — the script will ask for sudo when needed.
 #
 # Usage: ./syncoidsetup.sh [--site <name>] --remote <host> [--remote <host2> ...]
@@ -247,9 +247,253 @@ echo " Your key  : ${KEY_PATH}"
 echo " recsyncoid: ${REC_KEY_PATH}"
 echo " Deployed to: ${PROD_SERVERS[*]}"
 echo ""
-echo " Use this in your syncoid command:"
+echo " Generic syncoid template:"
 echo "   syncoid --no-privilege-elevation \\"
 echo "     --sshkey=${REC_KEY_PATH} \\"
 echo "     ${SEND_USER}@<prod-host>:pool/dataset \\"
 echo "     pool/backup/${SITE_NAME}/dataset"
 echo "════════════════════════════════════════════════════════"
+
+# ── 7. Interactive wizard — generate ready-to-use syncoid commands ────────────
+# Skip if stdin is not a terminal (e.g. piped/non-interactive run)
+if [[ ! -t 0 ]]; then
+    echo "[INFO] Non-interactive mode — skipping command wizard."
+    exit 0
+fi
+
+# Parse multi-select input into SELECTED_INDICES (global).
+# Returns 1 if input is 'q' or results in no valid indices.
+wizard_parse_selection() {
+    local input="$1"
+    local max="$2"
+    SELECTED_INDICES=()
+    [[ "${input}" == "q" ]] && return 1
+    if [[ "${input}" == "a" ]]; then
+        for ((i=1; i<=max; i++)); do SELECTED_INDICES+=("$i"); done
+        return 0
+    fi
+    # Normalise commas to spaces
+    input="${input//,/ }"
+    local token start end
+    for token in ${input}; do
+        if [[ "${token}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"
+            end="${BASH_REMATCH[2]}"
+            for ((i=start; i<=end; i++)); do
+                [[ $i -ge 1 && $i -le $max ]] && SELECTED_INDICES+=("$i")
+            done
+        elif [[ "${token}" =~ ^[0-9]+$ ]]; then
+            [[ ${token} -ge 1 && ${token} -le ${max} ]] && SELECTED_INDICES+=("${token}")
+        fi
+    done
+    [[ ${#SELECTED_INDICES[@]} -gt 0 ]]
+}
+
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " Syncoid Command Wizard"
+echo " (select datasets, destinations, and encryption options)"
+echo "════════════════════════════════════════════════════════"
+
+# Collect local ZFS datasets once for the destination picker
+LOCAL_DATASETS=()
+if command -v zfs > /dev/null 2>&1; then
+    mapfile -t LOCAL_DATASETS < <(sudo zfs list -H -o name 2>/dev/null || true)
+fi
+
+ALL_CMDS=()  # accumulates all generated commands across hosts
+
+for HOST in "${PROD_SERVERS[@]}"; do
+    echo ""
+    echo "┌─ Host: ${HOST} ──────────────────────────────────────────"
+
+    # Fetch remote dataset list via admin SSH (sendsyncoid key has command= restriction)
+    mapfile -t REMOTE_LINES < <(
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "${ADMIN_USER}@${HOST}" \
+            "sudo zfs list -H -r -o name,encryption,keystatus" 2>/dev/null || true
+    )
+
+    DS_NAMES=()
+    DS_ENCS=()
+
+    if [[ ${#REMOTE_LINES[@]} -eq 0 ]]; then
+        echo "│ [WARN] Could not list remote datasets (no sudo access or zfs unavailable)."
+        read -r -p "│ Enter dataset path manually (or press Enter to skip): " MANUAL_DS || true
+        if [[ -z "${MANUAL_DS}" ]]; then
+            echo "│ Skipping ${HOST}."
+            echo "└──────────────────────────────────────────────────────────"
+            continue
+        fi
+        DS_NAMES+=("${MANUAL_DS}")
+        DS_ENCS+=("unknown")
+    else
+        for line in "${REMOTE_LINES[@]}"; do
+            DS_NAMES+=("$(printf '%s' "${line}" | cut -f1)")
+            DS_ENCS+=("$(printf '%s' "${line}" | cut -f2)")
+        done
+    fi
+
+    # Display numbered dataset list
+    echo "│"
+    echo "│  Datasets on ${HOST}:"
+    for ((i=0; i<${#DS_NAMES[@]}; i++)); do
+        enc_label=""
+        [[ "${DS_ENCS[$i]}" != "off" && "${DS_ENCS[$i]}" != "-" ]] && enc_label="  [encrypted]"
+        printf "│    [%2d] %s%s\n" "$((i+1))" "${DS_NAMES[$i]}" "${enc_label}"
+    done
+    echo "│"
+    echo "│  Select datasets to replicate:"
+    echo "│    Numbers (e.g. 1 3, 1-3, 1,3,5), 'a' = all, Enter to skip host"
+    read -r -p "│  > " SEL_INPUT || true
+
+    if [[ -z "${SEL_INPUT}" || "${SEL_INPUT}" == "q" ]]; then
+        echo "│ Skipping ${HOST}."
+        echo "└──────────────────────────────────────────────────────────"
+        continue
+    fi
+
+    SELECTED_INDICES=()
+    if ! wizard_parse_selection "${SEL_INPUT}" "${#DS_NAMES[@]}"; then
+        echo "│ [WARN] No valid selection — skipping ${HOST}."
+        echo "└──────────────────────────────────────────────────────────"
+        continue
+    fi
+
+    # Map indices → dataset names
+    SEL_NAMES=()
+    for idx in "${SELECTED_INDICES[@]}"; do
+        SEL_NAMES+=("${DS_NAMES[$((idx-1))]}")
+    done
+
+    # Remove children whose parent is also selected (avoids double-replication)
+    FILTERED_NAMES=()
+    for ds in "${SEL_NAMES[@]}"; do
+        IS_CHILD=false
+        PARENT_DS=""
+        for other in "${SEL_NAMES[@]}"; do
+            [[ "${other}" == "${ds}" ]] && continue
+            if [[ "${ds}" == "${other}/"* ]]; then
+                IS_CHILD=true
+                PARENT_DS="${other}"
+                break
+            fi
+        done
+        if ${IS_CHILD}; then
+            echo "│ [INFO] Skipping '${ds}' — parent '${PARENT_DS}' selected (use --recursive on parent to include children)."
+        else
+            FILTERED_NAMES+=("${ds}")
+        fi
+    done
+
+    [[ ${#FILTERED_NAMES[@]} -eq 0 ]] && {
+        echo "│ No datasets to replicate after deduplication."
+        echo "└──────────────────────────────────────────────────────────"
+        continue
+    }
+
+    # Determine encryption policy for this host
+    HAS_ENCRYPTED=false
+    for ds in "${FILTERED_NAMES[@]}"; do
+        for ((i=0; i<${#DS_NAMES[@]}; i++)); do
+            if [[ "${DS_NAMES[$i]}" == "${ds}" && \
+                  "${DS_ENCS[$i]}" != "off" && "${DS_ENCS[$i]}" != "-" && "${DS_ENCS[$i]}" != "unknown" ]]; then
+                HAS_ENCRYPTED=true
+                break 2
+            fi
+        done
+    done
+
+    ENC_POLICY="raw"  # default: keep encryption
+    if ${HAS_ENCRYPTED}; then
+        echo "│"
+        echo "│  One or more datasets are encrypted. How should they be received?"
+        echo "│    [1] Raw — keep encryption on the backup server (recommended)"
+        echo "│    [2] Decrypted — backup server stores plaintext"
+        read -r -p "│  > Choice [1]: " ENC_CHOICE || true
+        [[ "${ENC_CHOICE}" == "2" ]] && ENC_POLICY="decrypt" || ENC_POLICY="raw"
+    fi
+
+    # Local destination parent
+    echo "│"
+    if [[ ${#LOCAL_DATASETS[@]} -gt 0 ]]; then
+        echo "│  Local ZFS datasets (select a destination parent):"
+        for ((i=0; i<${#LOCAL_DATASETS[@]}; i++)); do
+            printf "│    [%2d] %s\n" "$((i+1))" "${LOCAL_DATASETS[$i]}"
+        done
+        echo "│"
+        read -r -p "│  > Destination parent [number or path]: " DEST_INPUT || true
+        if [[ "${DEST_INPUT}" =~ ^[0-9]+$ ]] && \
+           [[ ${DEST_INPUT} -ge 1 && ${DEST_INPUT} -le ${#LOCAL_DATASETS[@]} ]]; then
+            LOCAL_PARENT="${LOCAL_DATASETS[$((DEST_INPUT-1))]}"
+        else
+            LOCAL_PARENT="${DEST_INPUT}"
+        fi
+    else
+        read -r -p "│  > Destination parent dataset (e.g. tank/backup): " LOCAL_PARENT || true
+    fi
+
+    if [[ -z "${LOCAL_PARENT}" ]]; then
+        echo "│ [WARN] No destination specified — skipping ${HOST}."
+        echo "└──────────────────────────────────────────────────────────"
+        continue
+    fi
+
+    # Build commands per selected dataset
+    HOST_CMDS=("# ── syncoid commands for site: ${SITE_NAME} / host: ${HOST}")
+    echo "│"
+    echo "│  Confirm destinations (press Enter to accept default):"
+
+    for ds in "${FILTERED_NAMES[@]}"; do
+        LEAF="${ds##*/}"
+        DEFAULT_DEST="${LOCAL_PARENT}/${SITE_NAME}/${LEAF}"
+        read -r -p "│    '${ds}' → [${DEFAULT_DEST}]: " CUSTOM_DEST || true
+        DEST="${DEFAULT_DEST}"
+        [[ -n "${CUSTOM_DEST}" ]] && DEST="${CUSTOM_DEST}"
+
+        # Check encryption for this specific dataset
+        DS_IS_ENC=false
+        for ((i=0; i<${#DS_NAMES[@]}; i++)); do
+            if [[ "${DS_NAMES[$i]}" == "${ds}" && \
+                  "${DS_ENCS[$i]}" != "off" && "${DS_ENCS[$i]}" != "-" && "${DS_ENCS[$i]}" != "unknown" ]]; then
+                DS_IS_ENC=true
+                break
+            fi
+        done
+
+        CMD="syncoid --no-privilege-elevation \\"$'\n'
+        CMD+="  --sshkey=${REC_KEY_PATH} \\"$'\n'
+        if ${DS_IS_ENC} && [[ "${ENC_POLICY}" == "raw" ]]; then
+            CMD+="  --sendoptions=w \\"$'\n'
+        fi
+        CMD+="  ${SEND_USER}@${HOST}:${ds} \\"$'\n'
+        CMD+="  ${DEST}"
+
+        HOST_CMDS+=("${CMD}")
+    done
+
+    # Preview commands in the box
+    echo "│"
+    for cmd in "${HOST_CMDS[@]}"; do
+        while IFS= read -r line; do
+            echo "│  ${line}"
+        done <<< "${cmd}"
+        echo "│"
+    done
+
+    ALL_CMDS+=("${HOST_CMDS[@]}")
+    echo "└──────────────────────────────────────────────────────────"
+done
+
+# Final clean printout of all commands
+if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════"
+    echo " All generated syncoid commands:"
+    echo "════════════════════════════════════════════════════════"
+    echo ""
+    for cmd in "${ALL_CMDS[@]}"; do
+        echo "${cmd}"
+        echo ""
+    done
+    echo "════════════════════════════════════════════════════════"
+fi
