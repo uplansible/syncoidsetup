@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.1.2
+# syncoidsetup.sh — v0.1.3
 # Run as your NORMAL USER — the script will ask for sudo when needed.
 #
 # Usage: ./syncoidsetup.sh [--site <name>] --remote <host> [--remote <host2> ...]
@@ -45,7 +45,7 @@ if [[ ! "${SITE_NAME}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
 fi
 
 for SERVER in "${PROD_SERVERS[@]}"; do
-    if [[ ! "${SERVER}" =~ ^[a-zA-Z0-9._:\[\]-]+$ ]]; then
+    if [[ ! "${SERVER}" =~ ^[][a-zA-Z0-9._:-]+$ ]]; then
         echo "[ERROR] Invalid server '${SERVER}': only letters, digits, '.', '_', ':', '[', ']', and '-' are allowed." >&2
         exit 1
     fi
