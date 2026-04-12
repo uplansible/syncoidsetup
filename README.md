@@ -1,5 +1,18 @@
 # syncoidsetup
 
+> **DISCLAIMER — WORK IN PROGRESS**
+>
+> This script is under active development and has **not been fully tested** across all environments.
+> It is provided **as-is, without any warranty** of any kind, express or implied.
+>
+> **Before running:**
+> - Review the entire script and understand what it does
+> - Back up your SSH keys, `authorized_keys` files, and any ZFS configuration
+> - Test in a non-production environment first
+> - Ensure you have a recovery path if SSH access is disrupted
+>
+> The authors accept no responsibility for data loss, locked-out servers, or any other damage resulting from use of this script.
+
 A script to automate SSH key-based authentication setup for [syncoid](https://github.com/jimsalterjrs/sanoid) (ZFS replication). Run it once per site and it handles key generation, local installation, and remote deployment across all your production servers.
 
 ## Prerequisites
