@@ -19,39 +19,39 @@ A script to automate SSH key-based authentication setup for [syncoid](https://gi
 
 - `sudo` access on the backup machine
 - SSH access (as your admin user) to each production server
-- `sendsyncoid` system account pre-created on each production server
-- `recsyncoid` system account pre-created on the backup machine
 - Tailscale installed (optional — used to restrict the SSH key to your backup network)
+
+> `recsyncoid` (backup machine) and `sendsyncoid` (production servers) are created automatically as system accounts if they do not already exist. You will be prompted locally before creation; remote accounts are created without prompting.
 
 ## Usage
 
 Run as your **normal user** (not root):
 
 ```bash
-./syncoidsetup.sh [site-name] <prod-server-1> [prod-server-2] ...
+./syncoidsetup.sh [--site <name>] --remote <host> [--remote <host2> ...]
 ```
 
-`site-name` is optional. When omitted, the backup server's hostname (`hostname -s`) is used — handy when running the same script on multiple backup machines without extra arguments.
+`--site` is optional. When omitted, the backup server's hostname (`hostname -s`) is used — handy when running the same script on multiple backup machines without extra arguments.
 
 ```bash
-# site-name defaults to hostname
-./syncoidsetup.sh 192.168.1.10 192.168.1.11
+# --site defaults to hostname
+./syncoidsetup.sh --remote 192.168.1.10 --remote 192.168.1.11
 
 # Explicit site-name
-./syncoidsetup.sh homelab 192.168.1.10 192.168.1.11
+./syncoidsetup.sh --site homelab --remote 192.168.1.10 --remote 192.168.1.11
 
 # Override source-IP restriction (skip Tailscale auto-detection)
-BACKUP_IP=100.64.0.5 ./syncoidsetup.sh 192.168.1.10
+BACKUP_IP=100.64.0.5 ./syncoidsetup.sh --remote 192.168.1.10
 ```
 
-The script will prompt for your sudo password once and keep the ticket alive for the duration.
+The script will prompt for your sudo password once and keep the ticket alive for up to ~500 s (self-terminating keepalive). It also validates all inputs and checks SSH connectivity to every production server before modifying anything locally.
 
 ## What it does
 
 1. Generates an ed25519 keypair at `~/.ssh/id_ed25519_<site-name>_syncoid` (skipped if already present)
-2. Installs the keypair into `recsyncoid`'s `.ssh/` directory on the backup machine; backs up any existing key to `.bak` first
-3. Detects your Tailscale IPv4 to add a `from="<ip>"` restriction to the authorized key (set `BACKUP_IP` manually to skip detection)
-4. SSHs into each production server and appends the public key to `sendsyncoid`'s `authorized_keys`, restricted to run only `/usr/sbin/zfs`
+2. Creates `recsyncoid` locally if absent (prompts first), then installs the keypair into its `.ssh/` directory; backs up any existing key to `.bak` first
+3. Detects your Tailscale IPv4 (or plain IPv6 as fallback) to add a `from="<ip>"` restriction to the authorized key (set `BACKUP_IP` manually to skip detection; Tailscale is optional)
+4. SSHs into each production server, creates `sendsyncoid` if absent, then appends the public key to its `authorized_keys`, restricted to run only `/usr/sbin/zfs`; duplicate detection uses SSH fingerprint comparison
 5. Hardens both accounts: shell set to `/usr/sbin/nologin`, password locked
 6. Prints the exact `syncoid` command to use
 
