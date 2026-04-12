@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.1.1
+# syncoidsetup.sh — v0.1.2
 # Run as your NORMAL USER — the script will ask for sudo when needed.
 #
 # Usage: ./syncoidsetup.sh [--site <name>] --remote <host> [--remote <host2> ...]
