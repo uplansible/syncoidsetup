@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.10
+# syncoidsetup.sh — v0.2.11
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -318,7 +318,12 @@ fi
 if \${ALREADY_PRESENT}; then
     echo "[INFO] Key already present in \${AUTH_FILE} (fingerprint match), skipping."
 else
-    printf '%s\n' "\$(printf '%s' "${AUTH_ENTRY_B64}" | base64 -d)" | _sudo tee -a "\${AUTH_FILE}" > /dev/null
+    # Write to a temp file first — avoids stdin conflict where _sudo's password
+    # pipe consumes stdin before tee can read the auth entry from it.
+    TMPAUTH=\$(mktemp)
+    printf '%s\n' "\$(printf '%s' "${AUTH_ENTRY_B64}" | base64 -d)" > "\${TMPAUTH}"
+    _sudo bash -c 'cat "$1" >> "$2"' -- "\${TMPAUTH}" "\${AUTH_FILE}"
+    rm -f "\${TMPAUTH}"
     echo "[OK] Key appended to \${AUTH_FILE}"
 fi
 
