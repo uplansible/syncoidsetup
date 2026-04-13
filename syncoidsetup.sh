@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.11
+# syncoidsetup.sh — v0.2.12
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -320,9 +320,11 @@ if \${ALREADY_PRESENT}; then
 else
     # Write to a temp file first — avoids stdin conflict where _sudo's password
     # pipe consumes stdin before tee can read the auth entry from it.
+    # \$1 / \$2 are escaped so the local shell doesn't expand them; they are
+    # passed as positional args to bash -c on the remote.
     TMPAUTH=\$(mktemp)
     printf '%s\n' "\$(printf '%s' "${AUTH_ENTRY_B64}" | base64 -d)" > "\${TMPAUTH}"
-    _sudo bash -c 'cat "$1" >> "$2"' -- "\${TMPAUTH}" "\${AUTH_FILE}"
+    _sudo bash -c 'cat "\$1" >> "\$2"' -- "\${TMPAUTH}" "\${AUTH_FILE}"
     rm -f "\${TMPAUTH}"
     echo "[OK] Key appended to \${AUTH_FILE}"
 fi
