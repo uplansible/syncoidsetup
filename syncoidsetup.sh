@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.4
+# syncoidsetup.sh — v0.2.5
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -39,21 +39,6 @@ BACKUP_USER=""
 PROD_SERVERS=()
 PROD_USERS=()
 
-# Tests whether user@host has passwordless sudo.
-# If not, prompts interactively and prints the base64-encoded password to stdout.
-# Prints an empty string if sudo is passwordless.
-get_remote_sudo_pass() {
-    local user="$1" host="$2"
-    if ssh -o BatchMode=yes -o ConnectTimeout=10 "${user}@${host}" \
-        "sudo -n true" >/dev/null 2>&1; then
-        printf ''
-    else
-        local pass
-        read -rsp "[PROMPT] Sudo password for ${user}@${host}: " pass
-        echo "" >&2
-        printf '%s' "${pass}" | base64 -w0
-    fi
-}
 
 # Split [user@]host into _SPLIT_USER and _SPLIT_HOST; user defaults to $USER
 split_userhost() {
@@ -169,19 +154,24 @@ PUB_KEY=$(cat "${KEY_PATH}.pub")
 PRIVKEY_B64=$(base64 -w0 "${KEY_PATH}")
 PUBKEY_B64=$(base64 -w0 "${KEY_PATH}.pub")
 
+# ── Sudo password (asked once, reused for all remote servers) ─────────────────
+_sudo_pass=""
+read -rsp "[PROMPT] Sudo password for remote servers (press Enter if passwordless): " _sudo_pass
+echo ""
+SUDO_B64=$(printf '%s' "${_sudo_pass}" | base64 -w0)
+unset _sudo_pass
+
 # ── 2. Set up recsyncoid on the backup server ─────────────────────────────────
 echo ""
 echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
-
-BACKUP_SUDO_B64=$(get_remote_sudo_pass "${BACKUP_USER}" "${BACKUP_HOST}")
 
 ssh -T "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
     2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
     << BACKUPEOF
 set -euo pipefail
 
-_SUDO_B64="${BACKUP_SUDO_B64}"
+_SUDO_B64="${SUDO_B64}"
 _sudo() {
     if [[ -n "\${_SUDO_B64}" ]]; then
         printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
@@ -250,15 +240,13 @@ for i in "${!PROD_SERVERS[@]}"; do
     echo ""
     echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
 
-    REMOTE_SUDO_B64=$(get_remote_sudo_pass "${REMOTE_ADMIN_USER}" "${HOST}")
-
     ssh -T "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << REMOTEEOF
 set -euo pipefail
 command -v bash > /dev/null || { echo "[ERROR] bash not found on ${HOST}"; exit 1; }
 
-_SUDO_B64="${REMOTE_SUDO_B64}"
+_SUDO_B64="${SUDO_B64}"
 _sudo() {
     if [[ -n "\${_SUDO_B64}" ]]; then
         printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
