@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.15
+# syncoidsetup.sh — v0.2.16
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -227,6 +227,14 @@ if command -v passwd > /dev/null; then
 else
     echo "[WARN] passwd not found — lock account for ${REC_USER} manually."
 fi
+
+# Grant ZFS receive permissions on every pool root so recsyncoid can receive streams.
+# Permissions propagate to all child datasets; zfs allow is idempotent.
+for _pool in \$(zfs list -H -o name -d 0 2>/dev/null || true); do
+    _sudo zfs allow -u "${REC_USER}" receive,create,mount,compression "\${_pool}"
+    echo "[OK] ZFS permissions (receive,create,mount,compression) granted to ${REC_USER} on \${_pool}"
+done
+
 echo "[OK] ${REC_USER} hardened and keys installed on \$(hostname)."
 BACKUPEOF
 
@@ -567,6 +575,21 @@ for i in "${!PROD_SERVERS[@]}"; do
     echo "│"
     read -r -p "│  > Middle path component for destinations [backup]: " DEST_MIDDLE || true
     [[ -z "${DEST_MIDDLE}" ]] && DEST_MIDDLE="backup"
+
+    # Ensure the parent path exists on the backup server before first receive
+    DEST_PARENT="${LOCAL_PARENT}/${DEST_MIDDLE}"
+    echo "│"
+    if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+            "zfs list -H -o name '${DEST_PARENT}' > /dev/null 2>&1"; then
+        echo "│  [INFO] Destination parent ${DEST_PARENT} already exists."
+    else
+        if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+                "sudo zfs create -p '${DEST_PARENT}'" 2>/dev/null; then
+            echo "│  [OK] Created destination parent: ${DEST_PARENT}"
+        else
+            echo "│  [WARN] Could not create ${DEST_PARENT} — create it manually before running syncoid."
+        fi
+    fi
 
     # Build commands per selected dataset
     HOST_CMDS=("# ── syncoid commands for site: ${SITE_NAME} / host: ${HOST}")
