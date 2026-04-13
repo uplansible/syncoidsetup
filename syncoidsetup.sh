@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.7
+# syncoidsetup.sh — v0.2.8
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -8,7 +8,7 @@
 #                     --remote [remoteuser@]remotehost \
 #                     [--remote [remoteuser2@]remotehost2 ...]
 #
-# --site   Optional. Defaults to this machine's hostname.
+# --site   Optional. Defaults to the backup server's short hostname.
 # user@    Optional for both --backup and --remote; defaults to $USER.
 #
 # Examples:
@@ -25,7 +25,7 @@ REC_USER="recsyncoid"
 
 usage() {
     echo "Usage: $0 [--site <name>] --backup [user@]host --remote [user@]host [--remote [user@]host2 ...]"
-    echo "       --site     Optional. Site name for this backup set (defaults to $(hostname -s))."
+    echo "       --site     Optional. Site name for this backup set (defaults to the backup server's short hostname)."
     echo "       --backup   Backup server in [user@]host format (user defaults to \$USER)."
     echo "       --remote   Production server(s) in [user@]host format (user defaults to \$USER). Repeatable."
     exit 1
@@ -72,7 +72,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "${SITE_NAME}" ]] && SITE_NAME=$(hostname -s)
+if [[ -z "${SITE_NAME}" ]]; then
+    if [[ "${BACKUP_HOST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SITE_NAME="${BACKUP_HOST//./-}"   # IPv4 → e.g. 100-64-0-10
+    else
+        SITE_NAME="${BACKUP_HOST%%.*}"    # FQDN/hostname → short name
+    fi
+fi
 [[ -z "${BACKUP_HOST}" ]] && { echo "[ERROR] --backup [user@]host is required." >&2; usage; }
 [[ ${#PROD_SERVERS[@]} -eq 0 ]] && { echo "[ERROR] At least one --remote [user@]host is required." >&2; usage; }
 
@@ -94,7 +100,7 @@ for SERVER in "${PROD_SERVERS[@]}"; do
     fi
 done
 
-# ── TCP reachability pre-check + BACKUP_IP resolution ────────────────────────
+# ── TCP reachability pre-check ────────────────────────────────────────────────
 # Checks port 22 only — does not test SSH authentication.
 echo "[INFO] Checking TCP reachability of all servers (port 22)..."
 ALL_HOSTS=("${BACKUP_HOST}" "${PROD_SERVERS[@]}")
@@ -110,25 +116,13 @@ for SERVER in "${ALL_HOSTS[@]}"; do
     fi
 done
 
-# Resolve BACKUP_HOST to an IP for the authorized_keys from= restriction.
-# Honour a pre-set BACKUP_IP env var; otherwise derive from --backup.
+# BACKUP_IP for the authorized_keys from= restriction is resolved after SSH connection
+# to the backup server (see below), so the correct outgoing IP is used rather than
+# the IP as seen from this management machine.
+# Honour a pre-set BACKUP_IP env var to override.
 if [[ -n "${BACKUP_IP:-}" ]]; then
     echo "[INFO] Using pre-set BACKUP_IP=${BACKUP_IP}"
-elif [[ "${BACKUP_HOST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    # Already an IPv4 address
-    BACKUP_IP="${BACKUP_HOST}"
-elif [[ "${BACKUP_HOST}" == *:* ]]; then
-    # Already an IPv6 address
-    BACKUP_IP="${BACKUP_HOST}"
-else
-    BACKUP_IP=$(getent hosts "${BACKUP_HOST}" 2>/dev/null | awk '{print $1; exit}' || true)
-    if [[ -z "${BACKUP_IP}" ]]; then
-        echo "[ERROR] Could not resolve '${BACKUP_HOST}' to an IP address." >&2
-        echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
-        exit 1
-    fi
 fi
-echo "[INFO] Backup server IP for from= restriction: ${BACKUP_IP}"
 
 # ── SSH ControlMaster — one TCP connection per host, reused for all SSH calls ──
 _CTLDIR=$(mktemp -d)
@@ -234,6 +228,22 @@ REC_HOME=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOS
     "getent passwd ${REC_USER} | cut -d: -f6")
 REC_SSH_DIR="${REC_HOME}/.ssh"
 REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
+
+# Resolve BACKUP_IP from the backup server's perspective so the from= restriction
+# matches the IP it actually uses when connecting outbound to production servers.
+if [[ -z "${BACKUP_IP:-}" ]]; then
+    _PROBE="${PROD_SERVERS[0]}"
+    BACKUP_IP=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+        "ip route get '${_PROBE}' 2>/dev/null | awk '/src/{print \$NF; exit}' || \
+         ip route get 8.8.8.8 2>/dev/null | awk '/src/{print \$NF; exit}' || \
+         hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
+    if [[ -z "${BACKUP_IP}" ]]; then
+        echo "[ERROR] Could not determine backup server's outgoing IP for from= restriction." >&2
+        echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
+        exit 1
+    fi
+    echo "[INFO] Backup server IP for from= restriction: ${BACKUP_IP}"
+fi
 
 # ── 3. Build authorized_keys entry with from= source-IP restriction ───────────
 AUTH_ENTRY="restrict,from=\"${BACKUP_IP}\",command=\"/usr/sbin/zfs\" ${PUB_KEY}"
@@ -523,14 +533,19 @@ for i in "${!PROD_SERVERS[@]}"; do
         continue
     fi
 
+    # Ask once per host for the middle path component used in default destinations
+    echo "│"
+    read -r -p "│  > Middle path component for destinations [backup]: " DEST_MIDDLE || true
+    [[ -z "${DEST_MIDDLE}" ]] && DEST_MIDDLE="backup"
+
     # Build commands per selected dataset
     HOST_CMDS=("# ── syncoid commands for site: ${SITE_NAME} / host: ${HOST}")
     echo "│"
-    echo "│  Confirm destinations (press Enter to accept default):"
+    echo "│  Confirm destinations (press Enter to accept default, or type full path to override):"
 
     for ds in "${FILTERED_NAMES[@]}"; do
         LEAF="${ds##*/}"
-        DEFAULT_DEST="${LOCAL_PARENT}/${SITE_NAME}/${LEAF}"
+        DEFAULT_DEST="${LOCAL_PARENT}/${DEST_MIDDLE}/${LEAF}"
         read -r -p "│    '${ds}' → [${DEFAULT_DEST}]: " CUSTOM_DEST || true
         DEST="${DEFAULT_DEST}"
         [[ -n "${CUSTOM_DEST}" ]] && DEST="${CUSTOM_DEST}"
