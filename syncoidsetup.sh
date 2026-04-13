@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.16
+# syncoidsetup.sh — v0.2.17
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -622,6 +622,7 @@ for i in "${!PROD_SERVERS[@]}"; do
         CMD="sudo -H -u ${REC_USER} bash -c \\"$'\n'
         CMD+="  'syncoid --no-privilege-elevation"
         CMD+=" --sshkey=${REC_KEY_PATH}"
+        CMD+=" --recvoptions=p"
         if ${DS_IS_ENC} && [[ "${ENC_POLICY}" == "raw" ]]; then
             CMD+=" --sendoptions=w"
         fi
