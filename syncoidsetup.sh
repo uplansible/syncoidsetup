@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.14
+# syncoidsetup.sh — v0.2.15
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -348,6 +348,14 @@ if command -v passwd > /dev/null; then
 else
     echo "[WARN] passwd not found — lock account for ${SEND_USER} manually."
 fi
+
+# Grant ZFS delegation on every pool root so sendsyncoid can send snapshots.
+# Permissions propagate to all child datasets; zfs allow is idempotent.
+for _pool in \$(zfs list -H -o name -d 0 2>/dev/null || true); do
+    _sudo zfs allow -u "${SEND_USER}" send,snapshot,hold,destroy "\${_pool}"
+    echo "[OK] ZFS permissions (send,snapshot,hold,destroy) granted to ${SEND_USER} on \${_pool}"
+done
+
 echo "[OK] ${SEND_USER} hardened on \$(hostname)"
 REMOTEEOF
 
