@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.8
+# syncoidsetup.sh — v0.2.9
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -74,7 +74,14 @@ done
 
 if [[ -z "${SITE_NAME}" ]]; then
     if [[ "${BACKUP_HOST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        SITE_NAME="${BACKUP_HOST//./-}"   # IPv4 → e.g. 100-64-0-10
+        # Try reverse DNS; fall back to IP with dots replaced by dashes
+        _REV=$(getent hosts "${BACKUP_HOST}" 2>/dev/null | awk '{print $2; exit}' || true)
+        if [[ -n "${_REV}" ]]; then
+            SITE_NAME="${_REV%%.*}"
+        else
+            SITE_NAME="${BACKUP_HOST//./-}"
+        fi
+        unset _REV
     else
         SITE_NAME="${BACKUP_HOST%%.*}"    # FQDN/hostname → short name
     fi
@@ -548,7 +555,13 @@ for i in "${!PROD_SERVERS[@]}"; do
         DEFAULT_DEST="${LOCAL_PARENT}/${DEST_MIDDLE}/${LEAF}"
         read -r -p "│    '${ds}' → [${DEFAULT_DEST}]: " CUSTOM_DEST || true
         DEST="${DEFAULT_DEST}"
-        [[ -n "${CUSTOM_DEST}" ]] && DEST="${CUSTOM_DEST}"
+        if [[ -n "${CUSTOM_DEST}" ]]; then
+            if [[ "${CUSTOM_DEST}" == */* ]]; then
+                DEST="${CUSTOM_DEST}"                              # full path override
+            else
+                DEST="${LOCAL_PARENT}/${DEST_MIDDLE}/${CUSTOM_DEST}"  # leaf rename only
+            fi
+        fi
 
         # Check encryption for this specific dataset
         DS_IS_ENC=false
