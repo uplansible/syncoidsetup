@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.17
+# syncoidsetup.sh — v0.2.18
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -227,14 +227,6 @@ if command -v passwd > /dev/null; then
 else
     echo "[WARN] passwd not found — lock account for ${REC_USER} manually."
 fi
-
-# Grant ZFS receive permissions on every pool root so recsyncoid can receive streams.
-# Permissions propagate to all child datasets; zfs allow is idempotent.
-for _pool in \$(zfs list -H -o name -d 0 2>/dev/null || true); do
-    _sudo zfs allow -u "${REC_USER}" receive,create,mount,compression "\${_pool}"
-    echo "[OK] ZFS permissions (receive,create,mount,compression) granted to ${REC_USER} on \${_pool}"
-done
-
 echo "[OK] ${REC_USER} hardened and keys installed on \$(hostname)."
 BACKUPEOF
 
@@ -576,6 +568,17 @@ for i in "${!PROD_SERVERS[@]}"; do
     read -r -p "│  > Middle path component for destinations [backup]: " DEST_MIDDLE || true
     [[ -z "${DEST_MIDDLE}" ]] && DEST_MIDDLE="backup"
 
+    # Grant ZFS receive permissions on the selected destination parent only.
+    # Child datasets inherit, so this covers all datasets replicated under it.
+    echo "│"
+    if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+            "sudo zfs allow -u '${REC_USER}' receive,create,mount,compression '${LOCAL_PARENT}'" 2>/dev/null; then
+        echo "│  [OK] ZFS receive permissions granted to ${REC_USER} on ${LOCAL_PARENT}"
+    else
+        echo "│  [WARN] Could not grant ZFS permissions on ${LOCAL_PARENT} — grant manually:"
+        echo "│         sudo zfs allow -u ${REC_USER} receive,create,mount,compression ${LOCAL_PARENT}"
+    fi
+
     # Ensure the parent path exists on the backup server before first receive
     DEST_PARENT="${LOCAL_PARENT}/${DEST_MIDDLE}"
     echo "│"
@@ -622,7 +625,7 @@ for i in "${!PROD_SERVERS[@]}"; do
         CMD="sudo -H -u ${REC_USER} bash -c \\"$'\n'
         CMD+="  'syncoid --no-privilege-elevation"
         CMD+=" --sshkey=${REC_KEY_PATH}"
-        CMD+=" --recvoptions=p"
+        CMD+=" --recvoptions=pu"
         if ${DS_IS_ENC} && [[ "${ENC_POLICY}" == "raw" ]]; then
             CMD+=" --sendoptions=w"
         fi
