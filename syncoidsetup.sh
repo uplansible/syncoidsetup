@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.3
+# syncoidsetup.sh — v0.2.4
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -173,12 +173,6 @@ PUBKEY_B64=$(base64 -w0 "${KEY_PATH}.pub")
 echo ""
 echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
-# Pre-check: prompt before creating a new system account
-if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-    "id ${REC_USER}" > /dev/null 2>&1; then
-    read -r -p "[PROMPT] User '${REC_USER}' not found on ${BACKUP_HOST}. Create it now? [y/N] " yn
-    [[ "$yn" =~ ^[Yy]$ ]] || { echo "[ERROR] Cannot continue without ${REC_USER}."; exit 1; }
-fi
 
 BACKUP_SUDO_B64=$(get_remote_sudo_pass "${BACKUP_USER}" "${BACKUP_HOST}")
 
