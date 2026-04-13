@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.12
+# syncoidsetup.sh — v0.2.13
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -241,8 +241,8 @@ REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 if [[ -z "${BACKUP_IP:-}" ]]; then
     _PROBE="${PROD_SERVERS[0]}"
     BACKUP_IP=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-        "ip route get '${_PROBE}' 2>/dev/null | awk '/src/{print \$NF; exit}' || \
-         ip route get 8.8.8.8 2>/dev/null | awk '/src/{print \$NF; exit}' || \
+        "ip route get '${_PROBE}' 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
+         ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
          hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
     if [[ -z "${BACKUP_IP}" ]]; then
         echo "[ERROR] Could not determine backup server's outgoing IP for from= restriction." >&2
