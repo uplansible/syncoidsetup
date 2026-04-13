@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.9
+# syncoidsetup.sh — v0.2.10
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -253,7 +253,10 @@ if [[ -z "${BACKUP_IP:-}" ]]; then
 fi
 
 # ── 3. Build authorized_keys entry with from= source-IP restriction ───────────
+# Base64-encode to avoid quoting issues when embedded in the remote heredoc
+# (the entry contains literal " characters from from="..." and command="...")
 AUTH_ENTRY="restrict,from=\"${BACKUP_IP}\",command=\"/usr/sbin/zfs\" ${PUB_KEY}"
+AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
 
 # ── 4. Push public key to each production server via SSH ──────────────────────
 for i in "${!PROD_SERVERS[@]}"; do
@@ -315,7 +318,7 @@ fi
 if \${ALREADY_PRESENT}; then
     echo "[INFO] Key already present in \${AUTH_FILE} (fingerprint match), skipping."
 else
-    printf '%s\n' "${AUTH_ENTRY}" | _sudo tee -a "\${AUTH_FILE}" > /dev/null
+    printf '%s\n' "\$(printf '%s' "${AUTH_ENTRY_B64}" | base64 -d)" | _sudo tee -a "\${AUTH_FILE}" > /dev/null
     echo "[OK] Key appended to \${AUTH_FILE}"
 fi
 
