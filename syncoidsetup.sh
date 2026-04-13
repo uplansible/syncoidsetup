@@ -241,7 +241,7 @@ echo "[OK] ${REC_USER} hardened and keys installed on \$(hostname)."
 BACKUPEOF
 
 # Fetch REC_HOME from backup server so we can reference the key path in generated commands
-REC_HOME=$(ssh -o BatchMode=yes "${BACKUP_USER}@${BACKUP_HOST}" \
+REC_HOME=$(ssh -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
     "getent passwd ${REC_USER} | cut -d: -f6")
 REC_SSH_DIR="${REC_HOME}/.ssh"
 REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
