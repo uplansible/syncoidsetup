@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.6
+# syncoidsetup.sh — v0.2.7
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -130,6 +130,11 @@ else
 fi
 echo "[INFO] Backup server IP for from= restriction: ${BACKUP_IP}"
 
+# ── SSH ControlMaster — one TCP connection per host, reused for all SSH calls ──
+_CTLDIR=$(mktemp -d)
+trap 'rm -rf "${_CTLDIR}"' EXIT
+SSH_CTL=(-o ControlMaster=auto -o "ControlPath=${_CTLDIR}/%h_%p_%r" -o ControlPersist=60)
+
 KEY_PATH="${HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
 KEY_COMMENT="${SITE_NAME}-backup-syncoid"
 
@@ -166,7 +171,7 @@ echo ""
 echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
 
-ssh -T "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
+ssh -T "${SSH_CTL[@]}" "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
     2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
     << BACKUPEOF
 set -euo pipefail
@@ -225,7 +230,7 @@ echo "[OK] ${REC_USER} hardened and keys installed on \$(hostname)."
 BACKUPEOF
 
 # Fetch REC_HOME from backup server so we can reference the key path in generated commands
-REC_HOME=$(ssh -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+REC_HOME=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
     "getent passwd ${REC_USER} | cut -d: -f6")
 REC_SSH_DIR="${REC_HOME}/.ssh"
 REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
@@ -240,7 +245,7 @@ for i in "${!PROD_SERVERS[@]}"; do
     echo ""
     echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
 
-    ssh -T "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
+    ssh -T "${SSH_CTL[@]}" "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << REMOTEEOF
 set -euo pipefail
@@ -374,7 +379,7 @@ echo "════════════════════════�
 # Collect ZFS datasets from the backup server for the destination picker
 LOCAL_DATASETS=()
 mapfile -t LOCAL_DATASETS < <(
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+    ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
         "zfs list -H -o name" 2>/dev/null || true
 )
 
@@ -389,7 +394,7 @@ for i in "${!PROD_SERVERS[@]}"; do
 
     # Fetch remote dataset list via admin SSH (sendsyncoid key has command= restriction)
     mapfile -t REMOTE_LINES < <(
-        ssh -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE_ADMIN_USER}@${HOST}" \
+        ssh "${SSH_CTL[@]}" -o ConnectTimeout=5 "${REMOTE_ADMIN_USER}@${HOST}" \
             "zfs list -H -r -o name,encryption,keystatus" 2>/dev/null || true
     )
 
