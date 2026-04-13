@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.5
+# syncoidsetup.sh — v0.2.6
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -326,10 +326,8 @@ echo " Key (backup server ${BACKUP_HOST}): ${REC_KEY_PATH}"
 echo " Deployed to: ${PROD_SERVERS[*]}"
 echo ""
 echo " Generic syncoid template (run on ${BACKUP_HOST}):"
-echo "   syncoid --no-privilege-elevation \\"
-echo "     --sshkey=${REC_KEY_PATH} \\"
-echo "     ${SEND_USER}@<prod-host>:pool/dataset \\"
-echo "     pool/backup/${SITE_NAME}/dataset"
+echo "   sudo -H -u ${REC_USER} bash -c \\"
+echo "     'syncoid --no-privilege-elevation --sshkey=${REC_KEY_PATH} ${SEND_USER}@<prod-host>:pool/dataset pool/backup/${SITE_NAME}/dataset'"
 echo "════════════════════════════════════════════════════════"
 
 # ── 6. Interactive wizard — generate ready-to-use syncoid commands ────────────
@@ -542,13 +540,14 @@ for i in "${!PROD_SERVERS[@]}"; do
             fi
         done
 
-        CMD="syncoid --no-privilege-elevation \\"$'\n'
-        CMD+="  --sshkey=${REC_KEY_PATH} \\"$'\n'
+        CMD="sudo -H -u ${REC_USER} bash -c \\"$'\n'
+        CMD+="  'syncoid --no-privilege-elevation"
+        CMD+=" --sshkey=${REC_KEY_PATH}"
         if ${DS_IS_ENC} && [[ "${ENC_POLICY}" == "raw" ]]; then
-            CMD+="  --sendoptions=w \\"$'\n'
+            CMD+=" --sendoptions=w"
         fi
-        CMD+="  ${SEND_USER}@${HOST}:${ds} \\"$'\n'
-        CMD+="  ${DEST}"
+        CMD+=" ${SEND_USER}@${HOST}:${ds}"
+        CMD+=" ${DEST}'"
 
         HOST_CMDS+=("${CMD}")
     done
@@ -590,8 +589,9 @@ if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
         echo "# Production servers: ${PROD_SERVERS[*]}"
         echo "# Generated:          $(date '+%Y-%m-%d')"
         echo "#"
-        echo "# Run these commands on the backup server (${BACKUP_HOST}) as ${REC_USER},"
-        echo "# or schedule them with cron/systemd on the backup server."
+        echo "# Run these commands on the backup server (${BACKUP_HOST})."
+        echo "# Each command uses 'sudo -H -u ${REC_USER} bash -c ...' so it can be"
+        echo "# executed by any admin user, or scheduled via cron/systemd on the backup server."
         echo ""
         for cmd in "${ALL_CMDS[@]}"; do
             echo "${cmd}"
