@@ -89,3 +89,9 @@ syncoid --no-privilege-elevation \
 Both accounts have no interactive login shell and no password. The authorized key on each production server is locked to `/usr/sbin/zfs` only, and optionally restricted to the backup machine's Tailscale IP.
 
 Multiple sites are supported — each gets its own keypair, so access can be revoked per site.
+
+### Sudo password handling
+
+The script requires sudo access on each remote server. It first tests for passwordless sudo (`sudo -n true`). If that passes, no password is ever read. If it fails, the script prompts once per server and holds the password in a bash variable for the duration of the setup block — it is never written to disk, never passed as a command-line argument, and never appears in shell history (`read -rsp`). It transits to the remote only inside the SSH-encrypted connection.
+
+**Known trade-off:** the password lives in the bash process's memory for the lifetime of the script. On a shared machine a privileged user could in principle read it from `/proc/<pid>/mem`. This is acceptable on a single-user management machine. If you are on a shared system, configure passwordless sudo (`NOPASSWD`) on the remote servers instead — the script will then skip the prompt entirely.

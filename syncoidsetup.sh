@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.1
+# syncoidsetup.sh — v0.2.2
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -38,6 +38,22 @@ BACKUP_HOST=""
 BACKUP_USER=""
 PROD_SERVERS=()
 PROD_USERS=()
+
+# Tests whether user@host has passwordless sudo.
+# If not, prompts interactively and prints the base64-encoded password to stdout.
+# Prints an empty string if sudo is passwordless.
+get_remote_sudo_pass() {
+    local user="$1" host="$2"
+    if ssh -o BatchMode=yes -o ConnectTimeout=10 "${user}@${host}" \
+        "sudo -n true" >/dev/null 2>&1; then
+        printf ''
+    else
+        local pass
+        read -rsp "[PROMPT] Sudo password for ${user}@${host}: " pass
+        echo "" >&2
+        printf '%s' "${pass}" | base64 -w0
+    fi
+}
 
 # Split [user@]host into _SPLIT_USER and _SPLIT_HOST; user defaults to $USER
 split_userhost() {
@@ -164,14 +180,25 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
     [[ "$yn" =~ ^[Yy]$ ]] || { echo "[ERROR] Cannot continue without ${REC_USER}."; exit 1; }
 fi
 
+BACKUP_SUDO_B64=$(get_remote_sudo_pass "${BACKUP_USER}" "${BACKUP_HOST}")
+
 ssh -T "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
     2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
     << BACKUPEOF
 set -euo pipefail
 
+_SUDO_B64="${BACKUP_SUDO_B64}"
+_sudo() {
+    if [[ -n "\${_SUDO_B64}" ]]; then
+        printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
+    else
+        sudo "\$@"
+    fi
+}
+
 REM_REC_HOME=\$(getent passwd "${REC_USER}" | cut -d: -f6 || true)
 if [[ -z "\${REM_REC_HOME}" ]]; then
-    sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${REC_USER}"
+    _sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${REC_USER}"
     REM_REC_HOME=\$(getent passwd "${REC_USER}" | cut -d: -f6)
     echo "[OK] Created system user ${REC_USER}."
 fi
@@ -179,34 +206,34 @@ fi
 REM_SSH_DIR="\${REM_REC_HOME}/.ssh"
 REM_KEY_PATH="\${REM_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 
-sudo mkdir -p "\${REM_SSH_DIR}"
-sudo chmod 700 "\${REM_SSH_DIR}"
-sudo chown "${REC_USER}:${REC_USER}" "\${REM_SSH_DIR}"
+_sudo mkdir -p "\${REM_SSH_DIR}"
+_sudo chmod 700 "\${REM_SSH_DIR}"
+_sudo chown "${REC_USER}:${REC_USER}" "\${REM_SSH_DIR}"
 
-if sudo test -f "\${REM_KEY_PATH}"; then
-    sudo cp "\${REM_KEY_PATH}" "\${REM_KEY_PATH}.bak"
+if _sudo test -f "\${REM_KEY_PATH}"; then
+    _sudo cp "\${REM_KEY_PATH}" "\${REM_KEY_PATH}.bak"
     echo "[WARN] Existing private key backed up to \${REM_KEY_PATH}.bak"
 fi
 
 # Decode and install private key from base64
 TMPPRIV=\$(mktemp)
 echo "${PRIVKEY_B64}" | base64 -d > "\${TMPPRIV}"
-sudo install -m 600 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPRIV}" "\${REM_KEY_PATH}"
+_sudo install -m 600 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPRIV}" "\${REM_KEY_PATH}"
 rm -f "\${TMPPRIV}"
 
 # Decode and install public key from base64
 TMPPUB=\$(mktemp)
 echo "${PUBKEY_B64}" | base64 -d > "\${TMPPUB}"
-sudo install -m 644 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPUB}" "\${REM_KEY_PATH}.pub"
+_sudo install -m 644 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPUB}" "\${REM_KEY_PATH}.pub"
 rm -f "\${TMPPUB}"
 
 if command -v usermod > /dev/null; then
-    sudo usermod -s /usr/sbin/nologin "${REC_USER}"
+    _sudo usermod -s /usr/sbin/nologin "${REC_USER}"
 else
     echo "[WARN] usermod not found — set shell for ${REC_USER} to /usr/sbin/nologin manually."
 fi
 if command -v passwd > /dev/null; then
-    sudo passwd -l "${REC_USER}" > /dev/null
+    _sudo passwd -l "${REC_USER}" > /dev/null
 else
     echo "[WARN] passwd not found — lock account for ${REC_USER} manually."
 fi
@@ -229,11 +256,22 @@ for i in "${!PROD_SERVERS[@]}"; do
     echo ""
     echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
 
+    REMOTE_SUDO_B64=$(get_remote_sudo_pass "${REMOTE_ADMIN_USER}" "${HOST}")
+
     ssh -T "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << REMOTEEOF
 set -euo pipefail
 command -v bash > /dev/null || { echo "[ERROR] bash not found on ${HOST}"; exit 1; }
+
+_SUDO_B64="${REMOTE_SUDO_B64}"
+_sudo() {
+    if [[ -n "\${_SUDO_B64}" ]]; then
+        printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
+    else
+        sudo "\$@"
+    fi
+}
 
 # Check hard requirement: zfs must be present for syncoid to send snapshots
 command -v zfs > /dev/null || { echo "[ERROR] zfs not found on ${HOST} — install zfsutils-linux first."; exit 1; }
@@ -247,15 +285,15 @@ fi
 SEND_HOME=\$(getent passwd "${SEND_USER}" | cut -d: -f6 || true)
 if [[ -z "\${SEND_HOME}" ]]; then
     echo "[INFO] User '${SEND_USER}' not found on \$(hostname) — creating system account."
-    sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${SEND_USER}"
+    _sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${SEND_USER}"
     SEND_HOME=\$(getent passwd "${SEND_USER}" | cut -d: -f6)
 fi
 SSH_DIR="\${SEND_HOME}/.ssh"
 AUTH_FILE="\${SSH_DIR}/authorized_keys"
 
-sudo mkdir -p "\${SSH_DIR}"
-sudo chmod 700 "\${SSH_DIR}"
-sudo chown "${SEND_USER}:${SEND_USER}" "\${SSH_DIR}"
+_sudo mkdir -p "\${SSH_DIR}"
+_sudo chmod 700 "\${SSH_DIR}"
+_sudo chown "${SEND_USER}:${SEND_USER}" "\${SSH_DIR}"
 
 # Avoid duplicate entries by comparing SSH fingerprints
 TMPKEY=\$(mktemp)
@@ -264,8 +302,8 @@ NEW_FP=\$(ssh-keygen -lf "\${TMPKEY}" | awk '{print \$2}')
 rm -f "\${TMPKEY}"
 
 ALREADY_PRESENT=false
-if sudo test -f "\${AUTH_FILE}"; then
-    if sudo ssh-keygen -lf "\${AUTH_FILE}" 2>/dev/null | awk '{print \$2}' | grep -qF "\${NEW_FP}"; then
+if _sudo test -f "\${AUTH_FILE}"; then
+    if _sudo ssh-keygen -lf "\${AUTH_FILE}" 2>/dev/null | awk '{print \$2}' | grep -qF "\${NEW_FP}"; then
         ALREADY_PRESENT=true
     fi
 fi
@@ -273,21 +311,21 @@ fi
 if \${ALREADY_PRESENT}; then
     echo "[INFO] Key already present in \${AUTH_FILE} (fingerprint match), skipping."
 else
-    printf '%s\n' "${AUTH_ENTRY}" | sudo tee -a "\${AUTH_FILE}" > /dev/null
+    printf '%s\n' "${AUTH_ENTRY}" | _sudo tee -a "\${AUTH_FILE}" > /dev/null
     echo "[OK] Key appended to \${AUTH_FILE}"
 fi
 
-sudo chmod 600 "\${AUTH_FILE}"
-sudo chown "${SEND_USER}:${SEND_USER}" "\${AUTH_FILE}"
+_sudo chmod 600 "\${AUTH_FILE}"
+_sudo chown "${SEND_USER}:${SEND_USER}" "\${AUTH_FILE}"
 
 # Harden remote sendsyncoid account
 if command -v usermod > /dev/null; then
-    sudo usermod -s /usr/sbin/nologin "${SEND_USER}"
+    _sudo usermod -s /usr/sbin/nologin "${SEND_USER}"
 else
     echo "[WARN] usermod not found — set shell for ${SEND_USER} to /usr/sbin/nologin manually."
 fi
 if command -v passwd > /dev/null; then
-    sudo passwd -l "${SEND_USER}" > /dev/null
+    _sudo passwd -l "${SEND_USER}" > /dev/null
 else
     echo "[WARN] passwd not found — lock account for ${SEND_USER} manually."
 fi
