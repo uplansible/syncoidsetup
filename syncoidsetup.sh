@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.19
+# syncoidsetup.sh — v0.2.20
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -575,11 +575,11 @@ for i in "${!PROD_SERVERS[@]}"; do
     echo "│"
     if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
             "printf '%s\n' \"\$(printf '%s' '${SUDO_B64}' | base64 -d)\" | \
-             sudo -S -p '' zfs allow -u '${REC_USER}' receive,create,mount,compression '${LOCAL_PARENT}'" 2>/dev/null; then
+             sudo -S -p '' zfs allow -u '${REC_USER}' receive,create,mount,destroy,compression '${LOCAL_PARENT}'" 2>/dev/null; then
         echo "│  [OK] ZFS receive permissions granted to ${REC_USER} on ${LOCAL_PARENT}"
     else
         echo "│  [WARN] Could not grant ZFS permissions on ${LOCAL_PARENT} — grant manually:"
-        echo "│         sudo zfs allow -u ${REC_USER} receive,create,mount,compression ${LOCAL_PARENT}"
+        echo "│         sudo zfs allow -u ${REC_USER} receive,create,mount,destroy,compression ${LOCAL_PARENT}"
     fi
 
     # Ensure the parent path exists on the backup server before first receive
