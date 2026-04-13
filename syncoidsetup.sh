@@ -1,50 +1,88 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.1.4
-# Run as your NORMAL USER — the script will ask for sudo when needed.
+# syncoidsetup.sh — v0.2.1
+# Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
+# Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
-# Usage: ./syncoidsetup.sh [--site <name>] --remote <host> [--remote <host2> ...]
-# --site defaults to this machine's hostname if omitted.
-# Example: ./syncoidsetup.sh --site homelab --remote 100.64.0.1 --remote 100.64.0.2
-# Example: ./syncoidsetup.sh --remote 100.64.0.1 --remote 100.64.0.2
+# Usage:
+#   ./syncoidsetup.sh [--site <name>] --backup [backupuser@]backuphost \
+#                     --remote [remoteuser@]remotehost \
+#                     [--remote [remoteuser2@]remotehost2 ...]
+#
+# --site   Optional. Defaults to this machine's hostname.
+# user@    Optional for both --backup and --remote; defaults to $USER.
+#
+# Examples:
+#   ./syncoidsetup.sh --backup admin@100.64.0.10 --remote ubuntu@100.64.0.1
+#   ./syncoidsetup.sh --site homelab --backup 100.64.0.10 \
+#                     --remote ubuntu@100.64.0.1 --remote root@100.64.0.2
 
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SEND_USER="sendsyncoid"
 REC_USER="recsyncoid"
-ADMIN_USER="${SUDO_USER:-${USER}}"   # the actual human user, not root
 # ─────────────────────────────────────────────────────────────────────────────
 
 usage() {
-    echo "Usage: $0 [--site <name>] [--remote-user <user>] --remote <host> [--remote <host2> ...]"
-    echo "       --site        defaults to this machine's hostname if omitted."
-    echo "       --remote-user SSH username on the production servers (defaults to local user)."
+    echo "Usage: $0 [--site <name>] --backup [user@]host --remote [user@]host [--remote [user@]host2 ...]"
+    echo "       --site     Optional. Site name for this backup set (defaults to $(hostname -s))."
+    echo "       --backup   Backup server in [user@]host format (user defaults to \$USER)."
+    echo "       --remote   Production server(s) in [user@]host format (user defaults to \$USER). Repeatable."
     exit 1
 }
 
 [[ $EUID -eq 0 ]] && { echo "Do NOT run this script as root. Run as your normal user."; exit 1; }
 
 SITE_NAME=""
+BACKUP_HOST=""
+BACKUP_USER=""
 PROD_SERVERS=()
-REMOTE_ADMIN_USER=""
+PROD_USERS=()
+
+# Split [user@]host into _SPLIT_USER and _SPLIT_HOST; user defaults to $USER
+split_userhost() {
+    local val="$1"
+    if [[ "${val}" == *@* ]]; then
+        _SPLIT_USER="${val%%@*}"
+        _SPLIT_HOST="${val#*@}"
+    else
+        _SPLIT_USER="${USER}"
+        _SPLIT_HOST="${val}"
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --site)        SITE_NAME="$2";          shift 2 ;;
-        --remote)      PROD_SERVERS+=("$2");    shift 2 ;;
-        --remote-user) REMOTE_ADMIN_USER="$2";  shift 2 ;;
+        --site)
+            SITE_NAME="$2"
+            shift 2 ;;
+        --backup)
+            split_userhost "$2"
+            BACKUP_USER="${_SPLIT_USER}"
+            BACKUP_HOST="${_SPLIT_HOST}"
+            shift 2 ;;
+        --remote)
+            split_userhost "$2"
+            PROD_USERS+=("${_SPLIT_USER}")
+            PROD_SERVERS+=("${_SPLIT_HOST}")
+            shift 2 ;;
         -h|--help) usage ;;
         *) echo "[ERROR] Unknown argument: $1" >&2; usage ;;
     esac
 done
 
 [[ -z "${SITE_NAME}" ]] && SITE_NAME=$(hostname -s)
-REMOTE_ADMIN_USER="${REMOTE_ADMIN_USER:-${ADMIN_USER}}"
-[[ ${#PROD_SERVERS[@]} -eq 0 ]] && { echo "[ERROR] At least one --remote <host> is required." >&2; usage; }
+[[ -z "${BACKUP_HOST}" ]] && { echo "[ERROR] --backup [user@]host is required." >&2; usage; }
+[[ ${#PROD_SERVERS[@]} -eq 0 ]] && { echo "[ERROR] At least one --remote [user@]host is required." >&2; usage; }
 
 # ── Input validation ──────────────────────────────────────────────────────────
 if [[ ! "${SITE_NAME}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     echo "[ERROR] Invalid site-name '${SITE_NAME}': only letters, digits, '.', '_', and '-' are allowed." >&2
+    exit 1
+fi
+
+if [[ ! "${BACKUP_HOST}" =~ ^[][a-zA-Z0-9._:-]+$ ]]; then
+    echo "[ERROR] Invalid backup host '${BACKUP_HOST}'." >&2
     exit 1
 fi
 
@@ -55,13 +93,14 @@ for SERVER in "${PROD_SERVERS[@]}"; do
     fi
 done
 
-# ── TCP reachability pre-check (before any local changes) ────────────────────
+# ── TCP reachability pre-check + BACKUP_IP resolution ────────────────────────
 # Checks port 22 only — does not test SSH authentication.
-echo "[INFO] Checking TCP reachability of all production servers (port 22)..."
-for SERVER in "${PROD_SERVERS[@]}"; do
+echo "[INFO] Checking TCP reachability of all servers (port 22)..."
+ALL_HOSTS=("${BACKUP_HOST}" "${PROD_SERVERS[@]}")
+for SERVER in "${ALL_HOSTS[@]}"; do
     if command -v nc > /dev/null 2>&1; then
         if ! nc -z -w 5 "${SERVER}" 22 2>/dev/null; then
-            echo "[ERROR] Cannot reach ${SERVER}:22 — aborting before making any local changes." >&2
+            echo "[ERROR] Cannot reach ${SERVER}:22 — aborting before making any changes." >&2
             exit 1
         fi
         echo "[OK] Reachable: ${SERVER}"
@@ -70,19 +109,30 @@ for SERVER in "${PROD_SERVERS[@]}"; do
     fi
 done
 
+# Resolve BACKUP_HOST to an IP for the authorized_keys from= restriction.
+# Honour a pre-set BACKUP_IP env var; otherwise derive from --backup.
+if [[ -n "${BACKUP_IP:-}" ]]; then
+    echo "[INFO] Using pre-set BACKUP_IP=${BACKUP_IP}"
+elif [[ "${BACKUP_HOST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # Already an IPv4 address
+    BACKUP_IP="${BACKUP_HOST}"
+elif [[ "${BACKUP_HOST}" == *:* ]]; then
+    # Already an IPv6 address
+    BACKUP_IP="${BACKUP_HOST}"
+else
+    BACKUP_IP=$(getent hosts "${BACKUP_HOST}" 2>/dev/null | awk '{print $1; exit}' || true)
+    if [[ -z "${BACKUP_IP}" ]]; then
+        echo "[ERROR] Could not resolve '${BACKUP_HOST}' to an IP address." >&2
+        echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
+        exit 1
+    fi
+fi
+echo "[INFO] Backup server IP for from= restriction: ${BACKUP_IP}"
+
 KEY_PATH="${HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
 KEY_COMMENT="${SITE_NAME}-backup-syncoid"
 
-# ── 1. Validate and cache sudo credentials upfront ───────────────────────────
-echo "[INFO] This script needs sudo for a few local operations."
-echo "       Please enter your sudo password once:"
-sudo -v
-# Keep the sudo ticket alive in the background for long-running scripts
-( for _ in $(seq 10); do sleep 50; sudo -v; done ) &
-SUDO_KEEPALIVE_PID=$!
-trap 'kill "${SUDO_KEEPALIVE_PID}" 2>/dev/null' EXIT INT TERM
-
-# ── 2. Generate key pair as the current user (no sudo needed) ─────────────────
+# ── 1. Generate key pair on the management machine (no sudo needed) ───────────
 mkdir -p "${HOME}/.ssh"
 chmod 700 "${HOME}/.ssh"
 
@@ -99,39 +149,57 @@ else
 fi
 
 PUB_KEY=$(cat "${KEY_PATH}.pub")
+# Encode keys as single-line base64 for safe transfer via heredoc
+PRIVKEY_B64=$(base64 -w0 "${KEY_PATH}")
+PUBKEY_B64=$(base64 -w0 "${KEY_PATH}.pub")
 
-# ── 3. Install key into recsyncoid's .ssh dir (sudo needed) ──────────────────
+# ── 2. Set up recsyncoid on the backup server ─────────────────────────────────
 echo ""
-echo "[INFO] Installing key into ${REC_USER}'s .ssh directory..."
+echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
-REC_HOME=$(getent passwd "${REC_USER}" | cut -d: -f6 || true)
-if [[ -z "${REC_HOME}" ]]; then
-    read -r -p "[PROMPT] User '${REC_USER}' not found locally. Create it now? [y/N] " yn
+# Pre-check: prompt before creating a new system account
+if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+    "id ${REC_USER}" > /dev/null 2>&1; then
+    read -r -p "[PROMPT] User '${REC_USER}' not found on ${BACKUP_HOST}. Create it now? [y/N] " yn
     [[ "$yn" =~ ^[Yy]$ ]] || { echo "[ERROR] Cannot continue without ${REC_USER}."; exit 1; }
+fi
+
+ssh -T "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
+    2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
+    << BACKUPEOF
+set -euo pipefail
+
+REM_REC_HOME=\$(getent passwd "${REC_USER}" | cut -d: -f6 || true)
+if [[ -z "\${REM_REC_HOME}" ]]; then
     sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${REC_USER}"
-    REC_HOME=$(getent passwd "${REC_USER}" | cut -d: -f6)
+    REM_REC_HOME=\$(getent passwd "${REC_USER}" | cut -d: -f6)
     echo "[OK] Created system user ${REC_USER}."
 fi
-REC_SSH_DIR="${REC_HOME}/.ssh"
-REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 
-sudo bash -s << LOCALEOF
-set -euo pipefail
-mkdir -p "${REC_SSH_DIR}"
-chmod 700 "${REC_SSH_DIR}"
-chown "${REC_USER}:${REC_USER}" "${REC_SSH_DIR}"
+REM_SSH_DIR="\${REM_REC_HOME}/.ssh"
+REM_KEY_PATH="\${REM_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 
-# Back up any existing private key before overwriting
-if [[ -f "${REC_KEY_PATH}" ]]; then
-    cp "${REC_KEY_PATH}" "${REC_KEY_PATH}.bak"
-    echo "[WARN] Existing key backed up to ${REC_KEY_PATH}.bak"
+sudo mkdir -p "\${REM_SSH_DIR}"
+sudo chmod 700 "\${REM_SSH_DIR}"
+sudo chown "${REC_USER}:${REC_USER}" "\${REM_SSH_DIR}"
+
+if sudo test -f "\${REM_KEY_PATH}"; then
+    sudo cp "\${REM_KEY_PATH}" "\${REM_KEY_PATH}.bak"
+    echo "[WARN] Existing private key backed up to \${REM_KEY_PATH}.bak"
 fi
 
-# Copy private and public key into recsyncoid's .ssh (install handles mode+owner atomically)
-install -m 600 -o "${REC_USER}" -g "${REC_USER}" "${KEY_PATH}"     "${REC_KEY_PATH}"
-install -m 644 -o "${REC_USER}" -g "${REC_USER}" "${KEY_PATH}.pub" "${REC_KEY_PATH}.pub"
+# Decode and install private key from base64
+TMPPRIV=\$(mktemp)
+echo "${PRIVKEY_B64}" | base64 -d > "\${TMPPRIV}"
+sudo install -m 600 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPRIV}" "\${REM_KEY_PATH}"
+rm -f "\${TMPPRIV}"
 
-# Harden local recsyncoid account
+# Decode and install public key from base64
+TMPPUB=\$(mktemp)
+echo "${PUBKEY_B64}" | base64 -d > "\${TMPPUB}"
+sudo install -m 644 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPUB}" "\${REM_KEY_PATH}.pub"
+rm -f "\${TMPPUB}"
+
 if command -v usermod > /dev/null; then
     sudo usermod -s /usr/sbin/nologin "${REC_USER}"
 else
@@ -142,42 +210,25 @@ if command -v passwd > /dev/null; then
 else
     echo "[WARN] passwd not found — lock account for ${REC_USER} manually."
 fi
-echo "[OK] ${REC_USER} hardened and key installed locally."
-LOCALEOF
+echo "[OK] ${REC_USER} hardened and keys installed on \$(hostname)."
+BACKUPEOF
 
-# ── 4. Detect Tailscale IP for from= restriction ──────────────────────────────
-# Honour a pre-set BACKUP_IP env var; otherwise probe Tailscale (take only first address).
-if [[ -z "${BACKUP_IP:-}" ]]; then
-    if command -v tailscale > /dev/null 2>&1; then
-        BACKUP_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
-        if [[ -z "${BACKUP_IP}" ]]; then
-            IPV6=$(tailscale ip -6 2>/dev/null | head -n1 || true)
-            [[ -n "${IPV6}" ]] && BACKUP_IP="${IPV6}"
-        fi
-    fi
-fi
-if [[ -n "${BACKUP_IP}" ]]; then
-    FROM_CLAUSE="from=\"${BACKUP_IP}\","
-    echo "[INFO] Tailscale IP: ${BACKUP_IP}"
-else
-    FROM_CLAUSE=""
-    echo "[WARN] Could not detect Tailscale IP — omitting 'from=' restriction."
-    echo "       To enforce source-IP restriction, set BACKUP_IP=<ip> before running."
-fi
+# Fetch REC_HOME from backup server so we can reference the key path in generated commands
+REC_HOME=$(ssh -o BatchMode=yes "${BACKUP_USER}@${BACKUP_HOST}" \
+    "getent passwd ${REC_USER} | cut -d: -f6")
+REC_SSH_DIR="${REC_HOME}/.ssh"
+REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 
-if [[ -n "${FROM_CLAUSE}" ]]; then
-    AUTH_ENTRY="restrict,${FROM_CLAUSE}command=\"/usr/sbin/zfs\" ${PUB_KEY}"
-else
-    AUTH_ENTRY="restrict,command=\"/usr/sbin/zfs\" ${PUB_KEY}"
-fi
+# ── 3. Build authorized_keys entry with from= source-IP restriction ───────────
+AUTH_ENTRY="restrict,from=\"${BACKUP_IP}\",command=\"/usr/sbin/zfs\" ${PUB_KEY}"
 
-# ── 5. Push public key to each production server via SSH ──────────────────────
-for HOST in "${PROD_SERVERS[@]}"; do
+# ── 4. Push public key to each production server via SSH ──────────────────────
+for i in "${!PROD_SERVERS[@]}"; do
+    HOST="${PROD_SERVERS[$i]}"
+    REMOTE_ADMIN_USER="${PROD_USERS[$i]}"
     echo ""
     echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
 
-    # We SSH as the admin user — no sudo needed locally for this step.
-    # The remote side uses sudo, which will prompt if the ticket isn't cached there.
     ssh -T "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << REMOTEEOF
@@ -246,22 +297,22 @@ REMOTEEOF
     echo "[OK] Done with ${HOST}"
 done
 
-# ── 6. Summary ────────────────────────────────────────────────────────────────
+# ── 5. Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════"
 echo " Setup complete for site: ${SITE_NAME}"
-echo " Your key  : ${KEY_PATH}"
-echo " recsyncoid: ${REC_KEY_PATH}"
+echo " Key (this machine): ${KEY_PATH}"
+echo " Key (backup server ${BACKUP_HOST}): ${REC_KEY_PATH}"
 echo " Deployed to: ${PROD_SERVERS[*]}"
 echo ""
-echo " Generic syncoid template:"
+echo " Generic syncoid template (run on ${BACKUP_HOST}):"
 echo "   syncoid --no-privilege-elevation \\"
 echo "     --sshkey=${REC_KEY_PATH} \\"
 echo "     ${SEND_USER}@<prod-host>:pool/dataset \\"
 echo "     pool/backup/${SITE_NAME}/dataset"
 echo "════════════════════════════════════════════════════════"
 
-# ── 7. Interactive wizard — generate ready-to-use syncoid commands ────────────
+# ── 6. Interactive wizard — generate ready-to-use syncoid commands ────────────
 # Skip if stdin is not a terminal (e.g. piped/non-interactive run)
 if [[ ! -t 0 ]]; then
     echo "[INFO] Non-interactive mode — skipping command wizard."
@@ -302,15 +353,19 @@ echo " Syncoid Command Wizard"
 echo " (select datasets, destinations, and encryption options)"
 echo "════════════════════════════════════════════════════════"
 
-# Collect local ZFS datasets once for the destination picker
+# Collect ZFS datasets from the backup server for the destination picker
 LOCAL_DATASETS=()
-if command -v zfs > /dev/null 2>&1; then
-    mapfile -t LOCAL_DATASETS < <(sudo zfs list -H -o name 2>/dev/null || true)
-fi
+mapfile -t LOCAL_DATASETS < <(
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+        "sudo zfs list -H -o name" 2>/dev/null || true
+)
 
 ALL_CMDS=()  # accumulates all generated commands across hosts
 
-for HOST in "${PROD_SERVERS[@]}"; do
+for i in "${!PROD_SERVERS[@]}"; do
+    HOST="${PROD_SERVERS[$i]}"
+    REMOTE_ADMIN_USER="${PROD_USERS[$i]}"
+
     echo ""
     echo "┌─ Host: ${HOST} ──────────────────────────────────────────"
 
@@ -343,10 +398,10 @@ for HOST in "${PROD_SERVERS[@]}"; do
     # Display numbered dataset list
     echo "│"
     echo "│  Datasets on ${HOST}:"
-    for ((i=0; i<${#DS_NAMES[@]}; i++)); do
+    for ((j=0; j<${#DS_NAMES[@]}; j++)); do
         enc_label=""
-        [[ "${DS_ENCS[$i]}" != "off" && "${DS_ENCS[$i]}" != "-" ]] && enc_label="  [encrypted]"
-        printf "│    [%2d] %s%s\n" "$((i+1))" "${DS_NAMES[$i]}" "${enc_label}"
+        [[ "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" ]] && enc_label="  [encrypted]"
+        printf "│    [%2d] %s%s\n" "$((j+1))" "${DS_NAMES[$j]}" "${enc_label}"
     done
     echo "│"
     echo "│  Select datasets to replicate:"
@@ -401,9 +456,9 @@ for HOST in "${PROD_SERVERS[@]}"; do
     # Determine encryption policy for this host
     HAS_ENCRYPTED=false
     for ds in "${FILTERED_NAMES[@]}"; do
-        for ((i=0; i<${#DS_NAMES[@]}; i++)); do
-            if [[ "${DS_NAMES[$i]}" == "${ds}" && \
-                  "${DS_ENCS[$i]}" != "off" && "${DS_ENCS[$i]}" != "-" && "${DS_ENCS[$i]}" != "unknown" ]]; then
+        for ((j=0; j<${#DS_NAMES[@]}; j++)); do
+            if [[ "${DS_NAMES[$j]}" == "${ds}" && \
+                  "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" && "${DS_ENCS[$j]}" != "unknown" ]]; then
                 HAS_ENCRYPTED=true
                 break 2
             fi
@@ -420,12 +475,12 @@ for HOST in "${PROD_SERVERS[@]}"; do
         [[ "${ENC_CHOICE}" == "2" ]] && ENC_POLICY="decrypt" || ENC_POLICY="raw"
     fi
 
-    # Local destination parent
+    # Destination parent on the backup server
     echo "│"
     if [[ ${#LOCAL_DATASETS[@]} -gt 0 ]]; then
-        echo "│  Local ZFS datasets (select a destination parent):"
-        for ((i=0; i<${#LOCAL_DATASETS[@]}; i++)); do
-            printf "│    [%2d] %s\n" "$((i+1))" "${LOCAL_DATASETS[$i]}"
+        echo "│  ZFS datasets on backup server ${BACKUP_HOST} (select destination parent):"
+        for ((j=0; j<${#LOCAL_DATASETS[@]}; j++)); do
+            printf "│    [%2d] %s\n" "$((j+1))" "${LOCAL_DATASETS[$j]}"
         done
         echo "│"
         read -r -p "│  > Destination parent [number or path]: " DEST_INPUT || true
@@ -436,7 +491,7 @@ for HOST in "${PROD_SERVERS[@]}"; do
             LOCAL_PARENT="${DEST_INPUT}"
         fi
     else
-        read -r -p "│  > Destination parent dataset (e.g. tank/backup): " LOCAL_PARENT || true
+        read -r -p "│  > Destination parent dataset on ${BACKUP_HOST} (e.g. tank/backup): " LOCAL_PARENT || true
     fi
 
     if [[ -z "${LOCAL_PARENT}" ]]; then
@@ -459,9 +514,9 @@ for HOST in "${PROD_SERVERS[@]}"; do
 
         # Check encryption for this specific dataset
         DS_IS_ENC=false
-        for ((i=0; i<${#DS_NAMES[@]}; i++)); do
-            if [[ "${DS_NAMES[$i]}" == "${ds}" && \
-                  "${DS_ENCS[$i]}" != "off" && "${DS_ENCS[$i]}" != "-" && "${DS_ENCS[$i]}" != "unknown" ]]; then
+        for ((j=0; j<${#DS_NAMES[@]}; j++)); do
+            if [[ "${DS_NAMES[$j]}" == "${ds}" && \
+                  "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" && "${DS_ENCS[$j]}" != "unknown" ]]; then
                 DS_IS_ENC=true
                 break
             fi
@@ -491,7 +546,7 @@ for HOST in "${PROD_SERVERS[@]}"; do
     echo "└──────────────────────────────────────────────────────────"
 done
 
-# Final clean printout of all commands
+# Final clean printout of all commands + write inventory file
 if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -503,4 +558,27 @@ if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
         echo ""
     done
     echo "════════════════════════════════════════════════════════"
+
+    # Write inventory file — a ready-to-run shell script saved locally
+    INVENTORY_DIR="${HOME}/.syncoid"
+    INVENTORY_FILE="${INVENTORY_DIR}/${SITE_NAME}.sh"
+    mkdir -p "${INVENTORY_DIR}"
+    {
+        echo "#!/usr/bin/env bash"
+        echo "# Syncoid replication commands for site: ${SITE_NAME}"
+        echo "# Backup server:      ${BACKUP_USER}@${BACKUP_HOST}"
+        echo "# Production servers: ${PROD_SERVERS[*]}"
+        echo "# Generated:          $(date '+%Y-%m-%d')"
+        echo "#"
+        echo "# Run these commands on the backup server (${BACKUP_HOST}) as ${REC_USER},"
+        echo "# or schedule them with cron/systemd on the backup server."
+        echo ""
+        for cmd in "${ALL_CMDS[@]}"; do
+            echo "${cmd}"
+            echo ""
+        done
+    } > "${INVENTORY_FILE}"
+    chmod 755 "${INVENTORY_FILE}"
+    echo ""
+    echo "[OK] Commands saved to: ${INVENTORY_FILE}"
 fi
