@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.13
+# syncoidsetup.sh — v0.2.14
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -253,9 +253,11 @@ if [[ -z "${BACKUP_IP:-}" ]]; then
 fi
 
 # ── 3. Build authorized_keys entry with from= source-IP restriction ───────────
-# Base64-encode to avoid quoting issues when embedded in the remote heredoc
-# (the entry contains literal " characters from from="..." and command="...")
-AUTH_ENTRY="restrict,from=\"${BACKUP_IP}\",command=\"/usr/sbin/zfs\" ${PUB_KEY}"
+# No command= restriction: sshd executes commands via the user's shell, and
+# /usr/sbin/nologin (the security shell) would ignore -c and block everything.
+# Security comes from: restrict (no forwarding/pty), from= IP, and key-only auth.
+# Base64-encode to avoid quoting issues when embedded in the remote heredoc.
+AUTH_ENTRY="restrict,from=\"${BACKUP_IP}\" ${PUB_KEY}"
 AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
 
 # ── 4. Push public key to each production server via SSH ──────────────────────
@@ -292,7 +294,7 @@ fi
 SEND_HOME=\$(getent passwd "${SEND_USER}" | cut -d: -f6 || true)
 if [[ -z "\${SEND_HOME}" ]]; then
     echo "[INFO] User '${SEND_USER}' not found on \$(hostname) — creating system account."
-    _sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${SEND_USER}"
+    _sudo useradd --system --no-create-home --shell /bin/sh "${SEND_USER}"
     SEND_HOME=\$(getent passwd "${SEND_USER}" | cut -d: -f6)
 fi
 SSH_DIR="\${SEND_HOME}/.ssh"
@@ -333,10 +335,13 @@ _sudo chmod 600 "\${AUTH_FILE}"
 _sudo chown "${SEND_USER}:${SEND_USER}" "\${AUTH_FILE}"
 
 # Harden remote sendsyncoid account
+# Shell must be /bin/sh (not nologin) — sshd runs commands via the shell,
+# and nologin ignores -c, blocking all SSH command execution.
+# Security is enforced by the authorized_keys restrict+from= restrictions.
 if command -v usermod > /dev/null; then
-    _sudo usermod -s /usr/sbin/nologin "${SEND_USER}"
+    _sudo usermod -s /bin/sh "${SEND_USER}"
 else
-    echo "[WARN] usermod not found — set shell for ${SEND_USER} to /usr/sbin/nologin manually."
+    echo "[WARN] usermod not found — set shell for ${SEND_USER} to /bin/sh manually."
 fi
 if command -v passwd > /dev/null; then
     _sudo passwd -l "${SEND_USER}" > /dev/null
