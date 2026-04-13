@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.2
+# syncoidsetup.sh — v0.2.3
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -395,7 +395,7 @@ echo "════════════════════════�
 LOCAL_DATASETS=()
 mapfile -t LOCAL_DATASETS < <(
     ssh -o BatchMode=yes -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-        "sudo zfs list -H -o name" 2>/dev/null || true
+        "zfs list -H -o name" 2>/dev/null || true
 )
 
 ALL_CMDS=()  # accumulates all generated commands across hosts
@@ -410,7 +410,7 @@ for i in "${!PROD_SERVERS[@]}"; do
     # Fetch remote dataset list via admin SSH (sendsyncoid key has command= restriction)
     mapfile -t REMOTE_LINES < <(
         ssh -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE_ADMIN_USER}@${HOST}" \
-            "sudo zfs list -H -r -o name,encryption,keystatus" 2>/dev/null || true
+            "zfs list -H -r -o name,encryption,keystatus" 2>/dev/null || true
     )
 
     DS_NAMES=()
