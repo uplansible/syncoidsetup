@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.22
+# syncoidsetup.sh — v0.2.23
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -8,8 +8,10 @@
 #                     --remote [remoteuser@]remotehost \
 #                     [--remote [remoteuser2@]remotehost2 ...]
 #
-# --push   Push mode: syncoid runs on each prod server and pushes to the backup server.
-#          Use when prod servers are intermittently online (default: pull mode, backup pulls).
+# --push          Push mode: syncoid runs on each prod server and pushes to the backup server.
+#                 Use when prod servers are intermittently online (default: pull mode, backup pulls).
+# --password-auth Force password auth for admin SSH (no pubkey). Use when many keys in agent
+#                 cause 'too many authentication failures'.
 # --site   Optional. Defaults to the backup server's short hostname.
 # user@    Optional for both --backup and --remote; defaults to $USER.
 #
@@ -40,8 +42,10 @@ REC_USER="recsyncoid"
 
 usage() {
     echo "Usage: $0 [--push] [--site <name>] --backup [user@]host --remote [user@]host [--remote [user@]host2 ...]"
-    echo "       --push     Push mode: syncoid runs on each prod server and pushes to the backup server."
-    echo "                  Use when prod servers are intermittently online."
+    echo "       --push          Push mode: syncoid runs on each prod server and pushes to the backup server."
+    echo "                       Use when prod servers are intermittently online."
+    echo "       --password-auth Force password authentication for admin SSH connections (no public key)."
+    echo "                       Use when you have many keys in your agent causing 'too many auth failures'."
     echo "       --site     Optional. Site name for this backup set (defaults to the backup server's short hostname)."
     echo "       --backup   Backup server in [user@]host format (user defaults to \$USER)."
     echo "       --remote   Production server(s) in [user@]host format (user defaults to \$USER). Repeatable."
@@ -56,6 +60,7 @@ BACKUP_USER=""
 PROD_SERVERS=()
 PROD_USERS=()
 PUSH_MODE=false
+PASSWORD_AUTH=false
 
 
 # Split [user@]host into _SPLIT_USER and _SPLIT_HOST; user defaults to $USER
@@ -89,6 +94,7 @@ while [[ $# -gt 0 ]]; do
             PROD_SERVERS+=("${_SPLIT_HOST}")
             shift 2 ;;
         --push) PUSH_MODE=true; shift ;;
+        --password-auth) PASSWORD_AUTH=true; shift ;;
         -h|--help) usage ;;
         *) echo "[ERROR] Unknown argument: $1" >&2; usage ;;
     esac
@@ -176,6 +182,9 @@ fi
 _CTLDIR=$(mktemp -d)
 trap 'rm -rf "${_CTLDIR}"' EXIT
 SSH_CTL=(-o ControlMaster=auto -o "ControlPath=${_CTLDIR}/%h_%p_%r" -o ControlPersist=60)
+if [[ "${PASSWORD_AUTH}" == "true" ]]; then
+    SSH_CTL+=(-o PreferredAuthentications=password -o PubkeyAuthentication=no)
+fi
 
 KEY_PATH="${HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
 KEY_COMMENT="${SITE_NAME}-backup-syncoid"
