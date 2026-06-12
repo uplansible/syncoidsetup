@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.24
+# syncoidsetup.sh — v0.2.25
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -545,12 +545,13 @@ AUTH_FILE="\${SSH_DIR}/authorized_keys"
 
 # Check if an entry with this exact PROD_IP + public key already exists.
 # Multiple prod servers share the same keypair but each has its own from= IP,
-# so we match on both the key and the IP to avoid false positives.
+# so we match on both the key and the full quoted from="IP" token — a bare
+# substring match would false-positive on prefixes (10.0.0.1 vs 10.0.0.11).
 ALREADY_PRESENT=false
 if _sudo test -f "\${AUTH_FILE}"; then
     # grep without -q on the pipe tail: -q's early exit would SIGPIPE the first
     # grep and fail the pipeline under pipefail despite a real match.
-    if _sudo grep -F "${PUB_KEY}" "\${AUTH_FILE}" 2>/dev/null | grep -F "${PROD_IP}" > /dev/null; then
+    if _sudo grep -F "${PUB_KEY}" "\${AUTH_FILE}" 2>/dev/null | grep -F "from=\"${PROD_IP}\"" > /dev/null; then
         ALREADY_PRESENT=true
     fi
 fi
@@ -865,19 +866,6 @@ for i in "${!PROD_SERVERS[@]}"; do
         echo "│         sudo zfs allow -u ${REC_USER} receive,create,mount,rollback,destroy,compression ${LOCAL_PARENT}"
     fi
 
-    # Ensure the parent path exists on the backup server before first receive
-    DEST_PARENT="${LOCAL_PARENT}/${DEST_MIDDLE}"
-    echo "│"
-    if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs list -H -o name "${DEST_PARENT}" > /dev/null 2>&1; then
-        echo "│  [INFO] Destination parent ${DEST_PARENT} already exists."
-    else
-        if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs create -p "${DEST_PARENT}" 2>/dev/null; then
-            echo "│  [OK] Created destination parent: ${DEST_PARENT}"
-        else
-            echo "│  [WARN] Could not create ${DEST_PARENT} — create it manually before running syncoid."
-        fi
-    fi
-
     # Build commands per selected dataset
     HOST_CMDS=("# ── syncoid commands for site: ${SITE_NAME} / host: ${HOST}")
     echo "│"
@@ -922,11 +910,27 @@ for i in "${!PROD_SERVERS[@]}"; do
             continue
         fi
 
+        # Ensure the full parent chain of this destination exists on the backup
+        # server — zfs receive cannot create missing intermediate datasets, and
+        # nested source paths (e.g. tank/srv/www) need parents below
+        # <parent>/<middle> too. zfs create -p is a no-op if it already exists.
+        DEST_PARENT="${DEST%/*}"
+        if ! _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs list -H -o name "${DEST_PARENT}" > /dev/null 2>&1; then
+            if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs create -p "${DEST_PARENT}" 2>/dev/null; then
+                echo "│    [OK] Created destination parent: ${DEST_PARENT}"
+            else
+                echo "│    [WARN] Could not create ${DEST_PARENT} — create it manually before running syncoid."
+            fi
+        fi
+
         if [[ "${PUSH_MODE}" == "true" ]]; then
             CMD="sudo -H -u ${SEND_USER} bash -c \\"$'\n'
             CMD+="  'syncoid --no-privilege-elevation"
             CMD+=" --sshkey=${SEND_KEY_PATH}"
-            CMD+=" --recvoptions=pu"
+            # Only 'u' (don't mount on receive) — syncoid whitelists recv options
+            # to h,o,x,u,v; 'p' is not among them (and zfs receive has no -p).
+            # Missing destination parents are pre-created by the wizard instead.
+            CMD+=" --recvoptions=u"
             if ${NEEDS_RECURSIVE}; then
                 CMD+=" --recursive"
             fi
@@ -939,7 +943,10 @@ for i in "${!PROD_SERVERS[@]}"; do
             CMD="sudo -H -u ${REC_USER} bash -c \\"$'\n'
             CMD+="  'syncoid --no-privilege-elevation"
             CMD+=" --sshkey=${REC_KEY_PATH}"
-            CMD+=" --recvoptions=pu"
+            # Only 'u' (don't mount on receive) — syncoid whitelists recv options
+            # to h,o,x,u,v; 'p' is not among them (and zfs receive has no -p).
+            # Missing destination parents are pre-created by the wizard instead.
+            CMD+=" --recvoptions=u"
             if ${NEEDS_RECURSIVE}; then
                 CMD+=" --recursive"
             fi
