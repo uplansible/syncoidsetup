@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.23
+# syncoidsetup.sh — v0.2.24
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -27,8 +27,8 @@
 #
 # Known limitations:
 #   - One sudo password is shared for all remote servers; prompt per-host not implemented.
-#   - The sudo password is forwarded through SSH command-line arguments (base64-encoded,
-#     visible in process listings). Acceptable on single-user management machines.
+#   - The sudo password is held base64-encoded in this script's memory and reaches remote
+#     shells only via stdin (heredocs) — never on a command line or in process listings.
 #   - The recsyncoid private key is stored unencrypted on the backup server (intentional
 #     for unattended replication; mitigated by restrict+from= in authorized_keys).
 #   - IPv6 literals passed to nc or ip-route-get may need bracket stripping not implemented.
@@ -186,6 +186,38 @@ if [[ "${PASSWORD_AUTH}" == "true" ]]; then
     SSH_CTL+=(-o PreferredAuthentications=password -o PubkeyAuthentication=no)
 fi
 
+# Resolve the source IP <admin@host> uses for outbound traffic toward <target>.
+# Hostname targets are resolved to an IP on the remote side first — 'ip route get'
+# only accepts addresses, and resolving remotely respects the server's own DNS view.
+# Falls back to the default-route source IP, then 'hostname -I'. Prints nothing on failure.
+_resolve_outbound_ip() {
+    local conn="$1" target="$2"
+    ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" \
+        "_t=\$(getent ahosts '${target}' 2>/dev/null | awk '{print \$1; exit}'); \
+         ip route get \"\${_t:-${target}}\" 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
+         ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
+         hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true
+}
+
+# Run one privileged command on <admin@host>. The sudo password travels inside a
+# heredoc on stdin — never as a command-line argument, so it cannot show up in
+# process listings on either machine. Use this (never bare "ssh host 'sudo ...'")
+# for any privileged call outside the big setup heredocs.
+_ssh_sudo() {
+    local conn="$1"; shift
+    local cmd
+    printf -v cmd '%q ' "$@"
+    ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" bash -s << SUDOEOF
+set -euo pipefail
+_SUDO_B64="${SUDO_B64}"
+if [[ -n "\${_SUDO_B64}" ]]; then
+    printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' ${cmd}
+else
+    sudo ${cmd}
+fi
+SUDOEOF
+}
+
 KEY_PATH="${HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
 KEY_COMMENT="${SITE_NAME}-backup-syncoid"
 
@@ -265,26 +297,31 @@ if [[ "${PUSH_MODE}" == "false" ]]; then
         echo "[WARN] Existing private key backed up to \${REM_KEY_PATH}.bak"
     fi
 
-    # Decode and install private key from base64
+    # Decode and install keys from base64. The EXIT trap ensures the decoded
+    # private key never lingers in /tmp if an install step below fails.
     TMPPRIV=\$(mktemp)
+    TMPPUB=\$(mktemp)
+    trap 'rm -f "\${TMPPRIV}" "\${TMPPUB}"' EXIT
     echo "${PRIVKEY_B64}" | base64 -d > "\${TMPPRIV}"
     _sudo install -m 600 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPRIV}" "\${REM_KEY_PATH}"
-    rm -f "\${TMPPRIV}"
-
-    # Decode and install public key from base64
-    TMPPUB=\$(mktemp)
     echo "${PUBKEY_B64}" | base64 -d > "\${TMPPUB}"
     _sudo install -m 644 -o "${REC_USER}" -g "${REC_USER}" "\${TMPPUB}" "\${REM_KEY_PATH}.pub"
-    rm -f "\${TMPPUB}"
 fi
 
 if command -v usermod > /dev/null; then
     # Push mode: recsyncoid must accept incoming SSH commands from prod servers — needs /bin/sh.
     # Pull mode: recsyncoid only initiates outbound connections — nologin is sufficient.
+    # But never downgrade an existing /bin/sh to nologin: a push-mode site configured
+    # earlier on this backup server depends on it for incoming SSH commands.
     if [[ "${PUSH_MODE}" == "true" ]]; then
         _sudo usermod -s /bin/sh "${REC_USER}"
     else
-        _sudo usermod -s /usr/sbin/nologin "${REC_USER}"
+        _CUR_SHELL=\$(getent passwd "${REC_USER}" | cut -d: -f7)
+        if [[ "\${_CUR_SHELL}" == "/bin/sh" ]]; then
+            echo "[WARN] ${REC_USER} shell is /bin/sh (a push-mode site may rely on it) — leaving unchanged."
+        else
+            _sudo usermod -s /usr/sbin/nologin "${REC_USER}"
+        fi
     fi
 else
     if [[ "${PUSH_MODE}" == "true" ]]; then
@@ -302,40 +339,17 @@ echo "[OK] ${REC_USER} hardened on \$(hostname)."
 BACKUPEOF
 
 # Fetch REC_HOME from backup server so we can reference the key path in generated commands
-REC_HOME=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+REC_HOME=$(ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
     "getent passwd ${REC_USER} | cut -d: -f6")
 REC_SSH_DIR="${REC_HOME}/.ssh"
 REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 
-# ── 3. Resolve source IP for from= restriction and build authorized_keys entry ──
-# Pull mode: resolve BACKUP_IP from the backup server's perspective so the from=
-# restriction in prod's authorized_keys matches the IP ma actually uses outbound.
-# Push mode: PROD_IP is resolved per prod server inside the setup loop below.
-AUTH_ENTRY_B64=""  # set in pull mode here; set per-host in push mode loop
-if [[ "${PUSH_MODE}" == "false" ]]; then
-    if [[ -z "${BACKUP_IP:-}" ]]; then
-        _PROBE="${PROD_SERVERS[0]}"
-        BACKUP_IP=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-            "ip route get '${_PROBE}' 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
-             ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
-             hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
-        if [[ -z "${BACKUP_IP}" ]]; then
-            echo "[ERROR] Could not determine backup server's outgoing IP for from= restriction." >&2
-            echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
-            exit 1
-        fi
-        [[ "${BACKUP_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${BACKUP_IP}" != -* ]] || {
-            echo "[ERROR] Resolved BACKUP_IP='${BACKUP_IP}' is not a valid address." >&2
-            echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
-            exit 1
-        }
-        echo "[INFO] Backup server IP for from= restriction: ${BACKUP_IP}"
-    fi
-    # No command= restriction: security comes from restrict (no forwarding/pty), from= IP, and key-only auth.
-    # Base64-encode to avoid quoting issues when embedded in the remote heredoc.
-    AUTH_ENTRY="restrict,from=\"${BACKUP_IP}\" ${PUB_KEY}"
-    AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
-fi
+# ── 3. from= source-IP restriction ────────────────────────────────────────────
+# Resolved per prod server inside the loop below — the backup server's outbound
+# IP can differ per prod (e.g. one reached via LAN, another via VPN), so a single
+# shared from= would lock out every prod except the one it was probed against.
+# The BACKUP_IP env var overrides resolution and applies to all prods.
+AUTH_ENTRY_B64=""  # rebuilt per host in the loop below (pull mode only)
 
 # ── 4. Push public key to each production server via SSH ──────────────────────
 for i in "${!PROD_SERVERS[@]}"; do
@@ -343,6 +357,31 @@ for i in "${!PROD_SERVERS[@]}"; do
     REMOTE_ADMIN_USER="${PROD_USERS[$i]}"
     echo ""
     echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
+
+    if [[ "${PUSH_MODE}" == "false" ]]; then
+        # Pull mode: resolve the backup server's outbound IP toward *this* prod
+        # for the from= restriction in this prod's authorized_keys entry.
+        if [[ -n "${BACKUP_IP:-}" ]]; then
+            FROM_IP="${BACKUP_IP}"
+        else
+            FROM_IP=$(_resolve_outbound_ip "${BACKUP_USER}@${BACKUP_HOST}" "${HOST}")
+            if [[ -z "${FROM_IP}" ]]; then
+                echo "[ERROR] Could not determine backup server's outgoing IP toward ${HOST} for from= restriction." >&2
+                echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
+                exit 1
+            fi
+            [[ "${FROM_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${FROM_IP}" != -* ]] || {
+                echo "[ERROR] Resolved backup IP '${FROM_IP}' toward ${HOST} is not a valid address." >&2
+                echo "        Set BACKUP_IP=<ip> in the environment to override." >&2
+                exit 1
+            }
+        fi
+        echo "[INFO] Backup server IP for from= restriction on ${HOST}: ${FROM_IP}"
+        # No command= restriction: security comes from restrict (no forwarding/pty), from= IP, and key-only auth.
+        # Base64-encode to avoid quoting issues when embedded in the remote heredoc.
+        AUTH_ENTRY="restrict,from=\"${FROM_IP}\" ${PUB_KEY}"
+        AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
+    fi
 
     ssh -T "${SSH_CTL[@]}" "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
@@ -397,7 +436,9 @@ if [[ "${PUSH_MODE}" == "false" ]]; then
 
     ALREADY_PRESENT=false
     if _sudo test -f "\${AUTH_FILE}"; then
-        if _sudo ssh-keygen -lf "\${AUTH_FILE}" 2>/dev/null | awk '{print \$2}' | grep -qF "\${NEW_FP}"; then
+        # grep without -q: -q exits on first match and the resulting SIGPIPE
+        # upstream would fail the pipeline under pipefail despite a real match.
+        if _sudo ssh-keygen -lf "\${AUTH_FILE}" 2>/dev/null | awk '{print \$2}' | grep -F "\${NEW_FP}" > /dev/null; then
             ALREADY_PRESENT=true
         fi
     fi
@@ -424,15 +465,14 @@ else
         echo "[WARN] Existing private key backed up to \${REM_KEY_PATH}.bak"
     fi
 
+    # EXIT trap ensures the decoded private key never lingers in /tmp on failure
     TMPPRIV=\$(mktemp)
+    TMPPUB=\$(mktemp)
+    trap 'rm -f "\${TMPPRIV}" "\${TMPPUB}"' EXIT
     echo "${PRIVKEY_B64}" | base64 -d > "\${TMPPRIV}"
     _sudo install -m 600 -o "${SEND_USER}" -g "${SEND_USER}" "\${TMPPRIV}" "\${REM_KEY_PATH}"
-    rm -f "\${TMPPRIV}"
-
-    TMPPUB=\$(mktemp)
     echo "${PUBKEY_B64}" | base64 -d > "\${TMPPUB}"
     _sudo install -m 644 -o "${SEND_USER}" -g "${SEND_USER}" "\${TMPPUB}" "\${REM_KEY_PATH}.pub"
-    rm -f "\${TMPPUB}"
     echo "[OK] Private key installed for ${SEND_USER} on \$(hostname)."
 fi
 
@@ -470,10 +510,7 @@ REMOTEEOF
         # Push mode: resolve the prod server's outbound IP toward the backup server,
         # then install the public key into recsyncoid's authorized_keys on the backup server.
         echo "[INFO] Resolving ${HOST}'s outbound IP toward ${BACKUP_HOST}..."
-        PROD_IP=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${PROD_USERS[$i]}@${HOST}" \
-            "ip route get '${BACKUP_HOST}' 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
-             ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
-             hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
+        PROD_IP=$(_resolve_outbound_ip "${PROD_USERS[$i]}@${HOST}" "${BACKUP_HOST}")
         if [[ -z "${PROD_IP}" ]]; then
             echo "[ERROR] Could not determine ${HOST}'s outgoing IP for from= restriction." >&2
             echo "        Set BACKUP_IP=<ip> or ensure ip/hostname tools are available on ${HOST}." >&2
@@ -511,7 +548,9 @@ AUTH_FILE="\${SSH_DIR}/authorized_keys"
 # so we match on both the key and the IP to avoid false positives.
 ALREADY_PRESENT=false
 if _sudo test -f "\${AUTH_FILE}"; then
-    if _sudo grep -F "${PUB_KEY}" "\${AUTH_FILE}" 2>/dev/null | grep -qF "${PROD_IP}"; then
+    # grep without -q on the pipe tail: -q's early exit would SIGPIPE the first
+    # grep and fail the pipeline under pipefail despite a real match.
+    if _sudo grep -F "${PUB_KEY}" "\${AUTH_FILE}" 2>/dev/null | grep -F "${PROD_IP}" > /dev/null; then
         ALREADY_PRESENT=true
     fi
 fi
@@ -545,7 +584,9 @@ if [[ "${PUSH_MODE}" == "true" ]]; then
     echo ""
     echo " Generic syncoid template (run on each prod server as ${SEND_USER}):"
     echo "   sudo -H -u ${SEND_USER} bash -c \\"
-    echo "     'syncoid --no-privilege-elevation --sshkey=~/.ssh/id_ed25519_${SITE_NAME}_syncoid pool/dataset ${REC_USER}@${BACKUP_HOST}:pool/backup/${SITE_NAME}/dataset'"
+    # \$HOME (not ~): tilde does not expand in a command argument after '=';
+    # $HOME expands in the inner bash, where sudo -H has set it to the target user's home.
+    echo "     'syncoid --no-privilege-elevation --sshkey=\$HOME/.ssh/id_ed25519_${SITE_NAME}_syncoid pool/dataset ${REC_USER}@${BACKUP_HOST}:pool/backup/${SITE_NAME}/dataset'"
 else
     echo " Key (backup server ${BACKUP_HOST}): ${REC_KEY_PATH}"
     echo " Deployed to: ${PROD_SERVERS[*]}"
@@ -594,7 +635,34 @@ wizard_parse_selection() {
             [[ ${token} -ge 1 && ${token} -le ${max} ]] && SELECTED_INDICES+=("${token}")
         fi
     done
-    [[ ${#SELECTED_INDICES[@]} -gt 0 ]]
+    [[ ${#SELECTED_INDICES[@]} -gt 0 ]] || return 1
+    # Deduplicate (e.g. '1,1' or overlapping ranges) while preserving order,
+    # so no dataset gets a duplicate command generated
+    local _seen=" "
+    local -a _out=()
+    for token in "${SELECTED_INDICES[@]}"; do
+        [[ "${_seen}" == *" ${token} "* ]] && continue
+        _seen+="${token} "
+        _out+=("${token}")
+    done
+    SELECTED_INDICES=("${_out[@]}")
+    return 0
+}
+
+# Quote a ZFS path for embedding inside the single-quoted bash -c string of a
+# generated command. Safe-charset names pass through unchanged; names with other
+# characters (ZFS allows spaces) are wrapped in double quotes, which the inner
+# shell strips. Returns 1 for names containing a single quote — those would
+# terminate the outer quoting and cannot be represented.
+wizard_quote_path() {
+    local s="$1"
+    [[ "${s}" == *\'* ]] && return 1
+    if [[ "${s}" =~ ^[a-zA-Z0-9._:/-]+$ ]]; then
+        printf '%s' "${s}"
+    else
+        s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//\$/\\\$}"; s="${s//\`/\\\`}"
+        printf '"%s"' "${s}"
+    fi
 }
 
 echo ""
@@ -603,11 +671,11 @@ echo " Syncoid Command Wizard"
 echo " (select datasets, destinations, and encryption options)"
 echo "════════════════════════════════════════════════════════"
 
-# Collect ZFS datasets from the backup server for the destination picker
+# Collect ZFS datasets from the backup server for the destination picker.
+# Via _ssh_sudo: plain zfs list can fail for non-root where /dev/zfs is root-only.
 LOCAL_DATASETS=()
 mapfile -t LOCAL_DATASETS < <(
-    ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-        "zfs list -H -o name" 2>/dev/null || true
+    _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs list -H -o name 2>/dev/null || true
 )
 
 ALL_CMDS=()  # accumulates all generated commands across hosts
@@ -622,7 +690,7 @@ for i in "${!PROD_SERVERS[@]}"; do
     # In push mode, resolve sendsyncoid's home on this prod server to build the key path
     SEND_KEY_PATH=""
     if [[ "${PUSH_MODE}" == "true" ]]; then
-        _SEND_HOME=$(ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${REMOTE_ADMIN_USER}@${HOST}" \
+        _SEND_HOME=$(ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${REMOTE_ADMIN_USER}@${HOST}" \
             "getent passwd '${SEND_USER}' | cut -d: -f6" 2>/dev/null || true)
         if [[ -z "${_SEND_HOME}" ]]; then
             echo "│ [WARN] Could not determine ${SEND_USER} home on ${HOST} — key path may be incorrect."
@@ -631,10 +699,11 @@ for i in "${!PROD_SERVERS[@]}"; do
         SEND_KEY_PATH="${_SEND_HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
     fi
 
-    # Fetch remote dataset list via admin SSH (sendsyncoid authorized_keys has restrict+from= only)
+    # Fetch remote dataset list via admin SSH (the syncoid key's from= restriction
+    # blocks the management machine from using it). Via _ssh_sudo so listing also
+    # works where plain zfs list fails for non-root.
     mapfile -t REMOTE_LINES < <(
-        ssh "${SSH_CTL[@]}" -o ConnectTimeout=5 "${REMOTE_ADMIN_USER}@${HOST}" \
-            "zfs list -H -r -o name,encryption,keystatus" 2>/dev/null || true
+        _ssh_sudo "${REMOTE_ADMIN_USER}@${HOST}" zfs list -H -r -o name,encryption,keystatus 2>/dev/null || true
     )
 
     DS_NAMES=()
@@ -645,6 +714,11 @@ for i in "${!PROD_SERVERS[@]}"; do
         read -r -p "│ Enter dataset path manually (or press Enter to skip): " MANUAL_DS || true
         if [[ -z "${MANUAL_DS}" ]]; then
             echo "│ Skipping ${HOST}."
+            echo "└──────────────────────────────────────────────────────────"
+            continue
+        fi
+        if [[ ! "${MANUAL_DS}" =~ ^[a-zA-Z0-9._:/-]+$ ]]; then
+            echo "│ [WARN] Invalid dataset path '${MANUAL_DS}' — skipping ${HOST}."
             echo "└──────────────────────────────────────────────────────────"
             continue
         fi
@@ -662,7 +736,7 @@ for i in "${!PROD_SERVERS[@]}"; do
     echo "│  Datasets on ${HOST}:"
     for ((j=0; j<${#DS_NAMES[@]}; j++)); do
         enc_label=""
-        [[ "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" ]] && enc_label="  [encrypted]"
+        [[ "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" && "${DS_ENCS[$j]}" != "unknown" ]] && enc_label="  [encrypted]"
         printf "│    [%2d] %s%s\n" "$((j+1))" "${DS_NAMES[$j]}" "${enc_label}"
     done
     echo "│"
@@ -765,20 +839,26 @@ for i in "${!PROD_SERVERS[@]}"; do
         echo "└──────────────────────────────────────────────────────────"
         continue
     fi
+    if [[ ! "${LOCAL_PARENT}" =~ ^[a-zA-Z0-9._:/-]+$ ]]; then
+        echo "│ [WARN] Invalid destination parent '${LOCAL_PARENT}' — skipping ${HOST}."
+        echo "└──────────────────────────────────────────────────────────"
+        continue
+    fi
 
     # Ask once per host for the middle path component used in default destinations
     echo "│"
     read -r -p "│  > Middle path component for destinations [backup]: " DEST_MIDDLE || true
     [[ -z "${DEST_MIDDLE}" ]] && DEST_MIDDLE="backup"
+    if [[ ! "${DEST_MIDDLE}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo "│ [WARN] Invalid middle component '${DEST_MIDDLE}' — using 'backup'."
+        DEST_MIDDLE="backup"
+    fi
 
     # Grant ZFS receive permissions on the selected destination parent only.
     # Child datasets inherit, so this covers all datasets replicated under it.
-    # Use the same password-pipe pattern as _sudo() in heredocs so this works
-    # even when the admin's sudo requires a password.
     echo "│"
-    if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-            "printf '%s\n' \"\$(printf '%s' '${SUDO_B64}' | base64 -d)\" | \
-             sudo -S -p '' zfs allow -u '${REC_USER}' receive,create,mount,rollback,destroy,compression '${LOCAL_PARENT}'" 2>/dev/null; then
+    if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" \
+            zfs allow -u "${REC_USER}" receive,create,mount,rollback,destroy,compression "${LOCAL_PARENT}" 2>/dev/null; then
         echo "│  [OK] ZFS receive permissions granted to ${REC_USER} on ${LOCAL_PARENT}"
     else
         echo "│  [WARN] Could not grant ZFS permissions on ${LOCAL_PARENT} — grant manually:"
@@ -788,13 +868,10 @@ for i in "${!PROD_SERVERS[@]}"; do
     # Ensure the parent path exists on the backup server before first receive
     DEST_PARENT="${LOCAL_PARENT}/${DEST_MIDDLE}"
     echo "│"
-    if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-            "zfs list -H -o name '${DEST_PARENT}' > /dev/null 2>&1"; then
+    if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs list -H -o name "${DEST_PARENT}" > /dev/null 2>&1; then
         echo "│  [INFO] Destination parent ${DEST_PARENT} already exists."
     else
-        if ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
-                "printf '%s\n' \"\$(printf '%s' '${SUDO_B64}' | base64 -d)\" | \
-                 sudo -S -p '' zfs create -p '${DEST_PARENT}'" 2>/dev/null; then
+        if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs create -p "${DEST_PARENT}" 2>/dev/null; then
             echo "│  [OK] Created destination parent: ${DEST_PARENT}"
         else
             echo "│  [WARN] Could not create ${DEST_PARENT} — create it manually before running syncoid."
@@ -840,8 +917,10 @@ for i in "${!PROD_SERVERS[@]}"; do
             [[ "${_rp}" == "${ds}" ]] && NEEDS_RECURSIVE=true && break
         done
 
-        printf -v Q_DS   '%q' "${ds}"
-        printf -v Q_DEST '%q' "${DEST}"
+        if ! Q_DS=$(wizard_quote_path "${ds}") || ! Q_DEST=$(wizard_quote_path "${DEST}"); then
+            echo "│    [WARN] '${ds}' or '${DEST}' contains a single quote — cannot generate a safe command, skipping."
+            continue
+        fi
 
         if [[ "${PUSH_MODE}" == "true" ]]; then
             CMD="sudo -H -u ${SEND_USER} bash -c \\"$'\n'
@@ -904,6 +983,12 @@ if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
     INVENTORY_DIR="${HOME}/.syncoid"
     INVENTORY_FILE="${INVENTORY_DIR}/${SITE_NAME}.sh"
     mkdir -p "${INVENTORY_DIR}"
+    # Keep the previous version — a re-run for a subset of hosts would otherwise
+    # silently discard commands generated for the site's other hosts
+    if [[ -f "${INVENTORY_FILE}" ]]; then
+        cp "${INVENTORY_FILE}" "${INVENTORY_FILE}.bak"
+        echo "[INFO] Previous inventory backed up to ${INVENTORY_FILE}.bak"
+    fi
     {
         echo "#!/usr/bin/env bash"
         echo "# Syncoid replication commands for site: ${SITE_NAME}"
