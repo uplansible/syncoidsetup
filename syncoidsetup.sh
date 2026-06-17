@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.25
+# syncoidsetup.sh — v0.2.26
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -32,6 +32,18 @@
 #   - The recsyncoid private key is stored unencrypted on the backup server (intentional
 #     for unattended replication; mitigated by restrict+from= in authorized_keys).
 #   - IPv6 literals passed to nc or ip-route-get may need bracket stripping not implemented.
+#
+# Security notes:
+#   - First connect is trust-on-first-use: the sudo password and the generated private key
+#     are sent into the remote shell over SSH. If a host key is not already in known_hosts,
+#     verify the fingerprint at the prompt — a MITM on that first connection could capture
+#     the shared sudo password. The script warns for any host missing from known_hosts.
+#   - authorized_keys entries use 'restrict' + 'from=<ip>' but deliberately NO 'command='
+#     (pinning syncoid's variable zfs invocations is fragile). Combined with the ZFS
+#     'destroy' delegation the syncoid users receive, possession of the private key plus the
+#     ability to present the pinned source IP is sufficient to destroy datasets. The from= IP
+#     is the only network control; source IPs are spoofable on a flat L2 segment. The private
+#     key is mode 600 under a password-locked account, which is the primary mitigation.
 
 set -euo pipefail
 
@@ -166,6 +178,22 @@ for SERVER in "${ALL_HOSTS[@]}"; do
     fi
 done
 
+# ── Host-key awareness ────────────────────────────────────────────────────────
+# The shared sudo password and the generated private key are delivered into the
+# remote shell on first connect. For any host not yet in known_hosts this is
+# trust-on-first-use: warn so the operator verifies the fingerprint at the prompt
+# rather than blindly trusting whatever answers (a first-connect MITM would
+# otherwise harvest the password). We do NOT force StrictHostKeyChecking — SSH's
+# default interactive prompt lets the operator confirm the fingerprint.
+if command -v ssh-keygen > /dev/null 2>&1; then
+    for SERVER in "${ALL_HOSTS[@]}"; do
+        if ! ssh-keygen -F "${SERVER}" > /dev/null 2>&1; then
+            echo "[WARN] No known_hosts entry for ${SERVER} — its host key will be trusted on first use this run."
+            echo "       Verify the fingerprint when prompted, or add it to ~/.ssh/known_hosts beforehand."
+        fi
+    done
+fi
+
 # BACKUP_IP for the authorized_keys from= restriction is resolved after SSH connection
 # to the backup server (see below), so the correct outgoing IP is used rather than
 # the IP as seen from this management machine.
@@ -192,11 +220,17 @@ fi
 # Falls back to the default-route source IP, then 'hostname -I'. Prints nothing on failure.
 _resolve_outbound_ip() {
     local conn="$1" target="$2"
-    ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" \
-        "_t=\$(getent ahosts '${target}' 2>/dev/null | awk '{print \$1; exit}'); \
-         ip route get \"\${_t:-${target}}\" 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
-         ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}' || \
-         hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true
+    # Each step falls back only when the previous produced an *empty* result.
+    # A bare 'cmd | awk || fallback' chain is wrong here: awk exits 0 even when
+    # it prints nothing, so a successful 'ip route get' with no 'src' field would
+    # swallow the fallback and return an empty string. Test emptiness explicitly.
+    ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" "
+        _t=\$(getent ahosts '${target}' 2>/dev/null | awk '{print \$1; exit}')
+        _ip=\$(ip route get \"\${_t:-${target}}\" 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}')
+        [ -z \"\${_ip}\" ] && _ip=\$(ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}')
+        [ -z \"\${_ip}\" ] && _ip=\$(hostname -I 2>/dev/null | awk '{print \$1}')
+        printf '%s' \"\${_ip}\"
+    " 2>/dev/null || true
 }
 
 # Run one privileged command on <admin@host>. The sudo password travels inside a
@@ -432,6 +466,7 @@ if [[ "${PUSH_MODE}" == "false" ]]; then
     TMPKEY=\$(mktemp)
     printf '%s\n' "${PUB_KEY}" > "\${TMPKEY}"
     NEW_FP=\$(ssh-keygen -lf "\${TMPKEY}" | awk '{print \$2}')
+    KEY_BODY=\$(awk '{print \$2}' "\${TMPKEY}")   # exact base64 key material (field 2)
     rm -f "\${TMPKEY}"
 
     ALREADY_PRESENT=false
@@ -439,6 +474,11 @@ if [[ "${PUSH_MODE}" == "false" ]]; then
         # grep without -q: -q exits on first match and the resulting SIGPIPE
         # upstream would fail the pipeline under pipefail despite a real match.
         if _sudo ssh-keygen -lf "\${AUTH_FILE}" 2>/dev/null | awk '{print \$2}' | grep -F "\${NEW_FP}" > /dev/null; then
+            ALREADY_PRESENT=true
+        elif _sudo grep -F "\${KEY_BODY}" "\${AUTH_FILE}" > /dev/null 2>&1; then
+            # Fallback: a single malformed line can make 'ssh-keygen -lf' skip the
+            # whole file and print nothing, which would otherwise append a duplicate.
+            # Match the exact, full key body (entire field 2 — not a prefix) directly.
             ALREADY_PRESENT=true
         fi
     fi
@@ -666,6 +706,27 @@ wizard_quote_path() {
     fi
 }
 
+# True if a dataset is encrypted. Reads the per-host DS_NAMES/DS_ENCS globals.
+# With a second arg of "recursive", also returns true if any *descendant* is
+# encrypted — so a recursive pull of an unencrypted parent that has encrypted
+# children still triggers the raw-receive prompt and --sendoptions=w, instead
+# of silently storing those children decrypted on the backup server.
+wizard_is_encrypted() {
+    local target="$1" recursive="${2:-}" j match
+    for ((j=0; j<${#DS_NAMES[@]}; j++)); do
+        match=false
+        if [[ "${DS_NAMES[$j]}" == "${target}" ]]; then
+            match=true
+        elif [[ "${recursive}" == "recursive" && "${DS_NAMES[$j]}" == "${target}/"* ]]; then
+            match=true
+        fi
+        if ${match} && [[ "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" && "${DS_ENCS[$j]}" != "unknown" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 echo ""
 echo "════════════════════════════════════════════════════════"
 echo " Syncoid Command Wizard"
@@ -794,16 +855,18 @@ for i in "${!PROD_SERVERS[@]}"; do
         continue
     }
 
-    # Determine encryption policy for this host
+    # Determine encryption policy for this host. A dataset selected as a recursive
+    # parent is checked for encrypted descendants too (see wizard_is_encrypted).
     HAS_ENCRYPTED=false
     for ds in "${FILTERED_NAMES[@]}"; do
-        for ((j=0; j<${#DS_NAMES[@]}; j++)); do
-            if [[ "${DS_NAMES[$j]}" == "${ds}" && \
-                  "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" && "${DS_ENCS[$j]}" != "unknown" ]]; then
-                HAS_ENCRYPTED=true
-                break 2
-            fi
+        _rec=""
+        for _rp in "${RECURSIVE_PARENTS[@]}"; do
+            [[ "${_rp}" == "${ds}" ]] && _rec="recursive" && break
         done
+        if wizard_is_encrypted "${ds}" "${_rec}"; then
+            HAS_ENCRYPTED=true
+            break
+        fi
     done
 
     ENC_POLICY="raw"  # default: keep encryption
@@ -889,21 +952,20 @@ for i in "${!PROD_SERVERS[@]}"; do
             fi
         fi
 
-        # Check encryption for this specific dataset
-        DS_IS_ENC=false
-        for ((j=0; j<${#DS_NAMES[@]}; j++)); do
-            if [[ "${DS_NAMES[$j]}" == "${ds}" && \
-                  "${DS_ENCS[$j]}" != "off" && "${DS_ENCS[$j]}" != "-" && "${DS_ENCS[$j]}" != "unknown" ]]; then
-                DS_IS_ENC=true
-                break
-            fi
-        done
-
         # Check if this dataset needs --recursive (it was a parent with skipped children)
         NEEDS_RECURSIVE=false
         for _rp in "${RECURSIVE_PARENTS[@]}"; do
             [[ "${_rp}" == "${ds}" ]] && NEEDS_RECURSIVE=true && break
         done
+
+        # Check encryption for this dataset. When the send is recursive, encrypted
+        # descendants count too, so --sendoptions=w is added for the whole stream.
+        DS_IS_ENC=false
+        if ${NEEDS_RECURSIVE}; then
+            wizard_is_encrypted "${ds}" "recursive" && DS_IS_ENC=true
+        else
+            wizard_is_encrypted "${ds}" && DS_IS_ENC=true
+        fi
 
         if ! Q_DS=$(wizard_quote_path "${ds}") || ! Q_DEST=$(wizard_quote_path "${DEST}"); then
             echo "│    [WARN] '${ds}' or '${DEST}' contains a single quote — cannot generate a safe command, skipping."
@@ -1017,7 +1079,7 @@ if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
             echo ""
         done
     } > "${INVENTORY_FILE}"
-    chmod 755 "${INVENTORY_FILE}"
+    chmod 700 "${INVENTORY_FILE}"   # contains server IPs/layout — owner-only
     echo ""
     echo "[OK] Commands saved to: ${INVENTORY_FILE}"
 fi
