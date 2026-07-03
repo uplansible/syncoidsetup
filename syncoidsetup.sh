@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.26
+# syncoidsetup.sh — v0.2.27
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all prod servers.
 #
@@ -38,6 +38,10 @@
 #     are sent into the remote shell over SSH. If a host key is not already in known_hosts,
 #     verify the fingerprint at the prompt — a MITM on that first connection could capture
 #     the shared sudo password. The script warns for any host missing from known_hosts.
+#   - The syncoid users' known_hosts files are pre-seeded via ssh-keyscan so the first
+#     unattended replication run isn't blocked by the host-key prompt. The keyscan runs
+#     from the machine that will connect (backup server in pull mode, prod in push mode),
+#     so it is the same trust-on-first-use trade-off as the setup connection itself.
 #   - authorized_keys entries use 'restrict' + 'from=<ip>' but deliberately NO 'command='
 #     (pinning syncoid's variable zfs invocations is fragile). Combined with the ZFS
 #     'destroy' delegation the syncoid users receive, possession of the private key plus the
@@ -205,6 +209,17 @@ if [[ -n "${BACKUP_IP:-}" ]]; then
     }
     echo "[INFO] Using pre-set BACKUP_IP=${BACKUP_IP}"
 fi
+
+# Push-mode counterpart: PROD_IP overrides the resolved outbound IP of every
+# prod server for the from= restriction on the backup side (applies to all prods).
+if [[ -n "${PROD_IP:-}" ]]; then
+    [[ "${PROD_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${PROD_IP}" != -* ]] || {
+        echo "[ERROR] Invalid PROD_IP='${PROD_IP}': must contain only alphanumerics, ':', '.', '/', '-'." >&2
+        exit 1
+    }
+    echo "[INFO] Using pre-set PROD_IP=${PROD_IP}"
+fi
+PROD_IP_OVERRIDE="${PROD_IP:-}"
 
 # ── SSH ControlMaster — one TCP connection per host, reused for all SSH calls ──
 _CTLDIR=$(mktemp -d)
@@ -484,7 +499,21 @@ if [[ "${PUSH_MODE}" == "false" ]]; then
     fi
 
     if \${ALREADY_PRESENT}; then
-        echo "[INFO] Key already present in \${AUTH_FILE} (fingerprint match), skipping."
+        # The key may carry a stale from= (the backup server's IP changed since
+        # the last run), which silently breaks replication — verify and rewrite.
+        # grep without -q on the pipe tail: -q's early exit would SIGPIPE the
+        # first grep and fail the pipeline under pipefail despite a real match.
+        if _sudo grep -F "\${KEY_BODY}" "\${AUTH_FILE}" 2>/dev/null | grep -F "from=\"${FROM_IP}\"" > /dev/null; then
+            echo "[INFO] Key already present in \${AUTH_FILE} (fingerprint match), skipping."
+        else
+            echo "[INFO] Key present but its from= does not match ${FROM_IP} — rewriting entry."
+            TMPAUTH=\$(mktemp)
+            _sudo grep -vF "\${KEY_BODY}" "\${AUTH_FILE}" > "\${TMPAUTH}" || true
+            printf '%s\n' "\$(printf '%s' "${AUTH_ENTRY_B64}" | base64 -d)" >> "\${TMPAUTH}"
+            _sudo install -m 600 -o "${SEND_USER}" -g "${SEND_USER}" "\${TMPAUTH}" "\${AUTH_FILE}"
+            rm -f "\${TMPAUTH}"
+            echo "[OK] authorized_keys entry rewritten with from=\"${FROM_IP}\""
+        fi
     else
         # Write to a temp file first — avoids stdin conflict where _sudo's password
         # pipe consumes stdin before tee can read the auth entry from it.
@@ -514,6 +543,28 @@ else
     echo "${PUBKEY_B64}" | base64 -d > "\${TMPPUB}"
     _sudo install -m 644 -o "${SEND_USER}" -g "${SEND_USER}" "\${TMPPUB}" "\${REM_KEY_PATH}.pub"
     echo "[OK] Private key installed for ${SEND_USER} on \$(hostname)."
+
+    # Pre-seed the backup server's host key into sendsyncoid's known_hosts —
+    # push runs happen under cron/systemd, where the interactive host-key
+    # prompt would kill the first replication. Keyscan from this prod server
+    # (the machine that will connect) is the same TOFU trade-off as the rest
+    # of the setup.
+    KNOWN_HOSTS="\${SSH_DIR}/known_hosts"
+    if _sudo test -f "\${KNOWN_HOSTS}" && _sudo ssh-keygen -F "${BACKUP_HOST}" -f "\${KNOWN_HOSTS}" > /dev/null 2>&1; then
+        echo "[INFO] ${BACKUP_HOST} already in \${KNOWN_HOSTS}, skipping keyscan."
+    else
+        TMPKH=\$(mktemp)
+        if command -v ssh-keyscan > /dev/null 2>&1 \
+                && ssh-keyscan -T 5 "${BACKUP_HOST}" > "\${TMPKH}" 2>/dev/null && [[ -s "\${TMPKH}" ]]; then
+            _sudo bash -c 'cat "\$1" >> "\$2"' -- "\${TMPKH}" "\${KNOWN_HOSTS}"
+            _sudo chmod 644 "\${KNOWN_HOSTS}"
+            _sudo chown "${SEND_USER}:${SEND_USER}" "\${KNOWN_HOSTS}"
+            echo "[OK] ${BACKUP_HOST} host key added to \${KNOWN_HOSTS}"
+        else
+            echo "[WARN] ssh-keyscan of ${BACKUP_HOST} failed — run the first syncoid command interactively to accept the host key."
+        fi
+        rm -f "\${TMPKH}"
+    fi
 fi
 
 # Harden remote sendsyncoid account
@@ -533,8 +584,10 @@ fi
 
 # Grant ZFS delegation on every pool root so sendsyncoid can send snapshots.
 # Permissions propagate to all child datasets; zfs allow is idempotent.
+# Enumerate pools via _sudo — plain zfs list can fail for non-root where
+# /dev/zfs is root-only, which would silently skip the delegation.
 _FOUND_POOL=false
-for _pool in \$(zfs list -H -o name -d 0 2>/dev/null || true); do
+for _pool in \$(_sudo zfs list -H -o name -d 0 2>/dev/null || true); do
     _sudo zfs allow -u "${SEND_USER}" send,snapshot,hold,destroy "\${_pool}"
     echo "[OK] ZFS permissions (send,snapshot,hold,destroy) granted to ${SEND_USER} on \${_pool}"
     _FOUND_POOL=true
@@ -546,20 +599,64 @@ fi
 echo "[OK] ${SEND_USER} hardened on \$(hostname)"
 REMOTEEOF
 
+    if [[ "${PUSH_MODE}" == "false" ]]; then
+        # Pre-seed this prod's host key into recsyncoid's known_hosts on the
+        # backup server — the first syncoid run happens under cron/systemd,
+        # where the interactive host-key prompt would kill it. Keyscan runs
+        # from the backup server itself (the machine that will connect), so
+        # it's the same TOFU trade-off as the rest of the setup.
+        echo "[INFO] Seeding ${HOST}'s host key into ${REC_USER}'s known_hosts on ${BACKUP_HOST}..."
+        ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
+            2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
+            << KNOWNHOSTSEOF
+set -euo pipefail
+_SUDO_B64="${SUDO_B64}"
+_sudo() {
+    if [[ -n "\${_SUDO_B64}" ]]; then
+        printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
+    else
+        sudo "\$@"
+    fi
+}
+REC_HOME=\$(getent passwd "${REC_USER}" | cut -d: -f6)
+KNOWN_HOSTS="\${REC_HOME}/.ssh/known_hosts"
+if _sudo test -f "\${KNOWN_HOSTS}" && _sudo ssh-keygen -F "${HOST}" -f "\${KNOWN_HOSTS}" > /dev/null 2>&1; then
+    echo "[INFO] ${HOST} already in \${KNOWN_HOSTS}, skipping keyscan."
+else
+    TMPKH=\$(mktemp)
+    trap 'rm -f "\${TMPKH}"' EXIT
+    if command -v ssh-keyscan > /dev/null 2>&1 \
+            && ssh-keyscan -T 5 "${HOST}" > "\${TMPKH}" 2>/dev/null && [[ -s "\${TMPKH}" ]]; then
+        _sudo bash -c 'cat "\$1" >> "\$2"' -- "\${TMPKH}" "\${KNOWN_HOSTS}"
+        _sudo chmod 644 "\${KNOWN_HOSTS}"
+        _sudo chown "${REC_USER}:${REC_USER}" "\${KNOWN_HOSTS}"
+        echo "[OK] ${HOST} host key added to \${KNOWN_HOSTS}"
+    else
+        echo "[WARN] ssh-keyscan of ${HOST} failed — run the first syncoid command interactively to accept the host key."
+    fi
+fi
+KNOWNHOSTSEOF
+    fi
+
     if [[ "${PUSH_MODE}" == "true" ]]; then
         # Push mode: resolve the prod server's outbound IP toward the backup server,
         # then install the public key into recsyncoid's authorized_keys on the backup server.
-        echo "[INFO] Resolving ${HOST}'s outbound IP toward ${BACKUP_HOST}..."
-        PROD_IP=$(_resolve_outbound_ip "${PROD_USERS[$i]}@${HOST}" "${BACKUP_HOST}")
-        if [[ -z "${PROD_IP}" ]]; then
-            echo "[ERROR] Could not determine ${HOST}'s outgoing IP for from= restriction." >&2
-            echo "        Set BACKUP_IP=<ip> or ensure ip/hostname tools are available on ${HOST}." >&2
-            exit 1
+        if [[ -n "${PROD_IP_OVERRIDE}" ]]; then
+            PROD_IP="${PROD_IP_OVERRIDE}"
+        else
+            echo "[INFO] Resolving ${HOST}'s outbound IP toward ${BACKUP_HOST}..."
+            PROD_IP=$(_resolve_outbound_ip "${PROD_USERS[$i]}@${HOST}" "${BACKUP_HOST}")
+            if [[ -z "${PROD_IP}" ]]; then
+                echo "[ERROR] Could not determine ${HOST}'s outgoing IP for from= restriction." >&2
+                echo "        Set PROD_IP=<ip> in the environment to override." >&2
+                exit 1
+            fi
+            [[ "${PROD_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${PROD_IP}" != -* ]] || {
+                echo "[ERROR] Resolved PROD_IP='${PROD_IP}' for ${HOST} is not a valid address." >&2
+                echo "        Set PROD_IP=<ip> in the environment to override." >&2
+                exit 1
+            }
         fi
-        [[ "${PROD_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${PROD_IP}" != -* ]] || {
-            echo "[ERROR] Resolved PROD_IP='${PROD_IP}' for ${HOST} is not a valid address." >&2
-            exit 1
-        }
         echo "[INFO] ${HOST} outbound IP for from= restriction: ${PROD_IP}"
 
         PUSH_AUTH_ENTRY="restrict,from=\"${PROD_IP}\" ${PUB_KEY}"
@@ -656,6 +753,7 @@ fi
 wizard_parse_selection() {
     local input="$1"
     local max="$2"
+    local token start end i
     SELECTED_INDICES=()
     [[ "${input}" == "q" ]] && return 1
     if [[ "${input}" == "a" ]]; then
@@ -664,15 +762,20 @@ wizard_parse_selection() {
     fi
     # Normalise commas to spaces
     input="${input//,/ }"
-    local token start end
     for token in ${input}; do
-        if [[ "${token}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            start="${BASH_REMATCH[1]}"
-            end="${BASH_REMATCH[2]}"
+        # 10# forces base-10 ('08' would otherwise be rejected as invalid octal);
+        # {1,9} caps the digits so arithmetic cannot overflow. Range bounds are
+        # clamped to [1, max] so an oversized end value cannot spin the loop.
+        if [[ "${token}" =~ ^([0-9]{1,9})-([0-9]{1,9})$ ]]; then
+            start=$((10#${BASH_REMATCH[1]}))
+            end=$((10#${BASH_REMATCH[2]}))
+            (( start < 1 )) && start=1
+            (( end > max )) && end=${max}
             for ((i=start; i<=end; i++)); do
-                [[ $i -ge 1 && $i -le $max ]] && SELECTED_INDICES+=("$i")
+                SELECTED_INDICES+=("$i")
             done
-        elif [[ "${token}" =~ ^[0-9]+$ ]]; then
+        elif [[ "${token}" =~ ^[0-9]{1,9}$ ]]; then
+            token=$((10#${token}))
             [[ ${token} -ge 1 && ${token} -le ${max} ]] && SELECTED_INDICES+=("${token}")
         fi
     done
@@ -982,6 +1085,19 @@ for i in "${!PROD_SERVERS[@]}"; do
                 echo "│    [OK] Created destination parent: ${DEST_PARENT}"
             else
                 echo "│    [WARN] Could not create ${DEST_PARENT} — create it manually before running syncoid."
+            fi
+        fi
+
+        # A full-path override can land outside LOCAL_PARENT, where the receive
+        # permissions granted above don't reach — grant them on this destination's
+        # parent too (zfs allow is idempotent).
+        if [[ "${DEST}" != "${LOCAL_PARENT}" && "${DEST}" != "${LOCAL_PARENT}/"* ]]; then
+            if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" \
+                    zfs allow -u "${REC_USER}" receive,create,mount,rollback,destroy,compression "${DEST_PARENT}" 2>/dev/null; then
+                echo "│    [OK] ZFS receive permissions granted to ${REC_USER} on ${DEST_PARENT}"
+            else
+                echo "│    [WARN] Could not grant ZFS permissions on ${DEST_PARENT} — grant manually:"
+                echo "│           sudo zfs allow -u ${REC_USER} receive,create,mount,rollback,destroy,compression ${DEST_PARENT}"
             fi
         fi
 
