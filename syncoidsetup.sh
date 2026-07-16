@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.29
+# syncoidsetup.sh — v0.2.30
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all source servers.
 #
@@ -26,18 +26,18 @@
 #   mapfile     requires Bash 4.x+. macOS ships Bash 3.2: brew install bash
 #
 # Known limitations:
-#   - One sudo password is shared for all remote servers; prompt per-host not implemented.
-#   - The sudo password is held base64-encoded in this script's memory and reaches remote
-#     shells only via stdin (heredocs) — never on a command line or in process listings.
+#   - Sudo passwords are held base64-encoded in this script's memory and reach remote
+#     shells only via stdin — never on a command line or in process listings.
 #   - The recsyncoid private key is stored unencrypted on the backup server (intentional
 #     for unattended replication; mitigated by restrict+from= in authorized_keys).
 #   - IPv6 literals passed to nc or ip-route-get may need bracket stripping not implemented.
 #
 # Security notes:
-#   - First connect is trust-on-first-use: the sudo password and the generated private key
-#     are sent into the remote shell over SSH. If a host key is not already in known_hosts,
-#     verify the fingerprint at the prompt — a MITM on that first connection could capture
-#     the shared sudo password. The script warns for any host missing from known_hosts.
+#   - First connect is trust-on-first-use: each server's sudo password and the generated
+#     private key are sent into the remote shell over SSH. If a host key is not already in
+#     known_hosts, verify the fingerprint at the prompt — a MITM on that first connection
+#     could capture that host's sudo password. The script warns for any host missing from
+#     known_hosts.
 #   - The syncoid users' known_hosts files are pre-seeded via ssh-keyscan so the first
 #     unattended replication run isn't blocked by the host-key prompt. The keyscan runs
 #     from the machine that will connect (backup server in pull mode, source server in push mode),
@@ -183,7 +183,7 @@ for SERVER in "${ALL_HOSTS[@]}"; do
 done
 
 # ── Host-key awareness ────────────────────────────────────────────────────────
-# The shared sudo password and the generated private key are delivered into the
+# Each server's sudo password and the generated private key are delivered into the
 # remote shell on first connect. For any host not yet in known_hosts this is
 # trust-on-first-use: warn so the operator verifies the fingerprint at the prompt
 # rather than blindly trusting whatever answers (a first-connect MITM would
@@ -254,12 +254,13 @@ _resolve_outbound_ip() {
 # for any privileged call outside the big setup heredocs.
 _ssh_sudo() {
     local conn="$1"; shift
-    local cmd
+    local cmd _b64
     printf -v cmd '%q ' "$@"
-    # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64 and the %q-quoted command
+    _b64="${SUDO_B64_BY_HOST[${conn}]:-}"
+    # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password and the %q-quoted command
     ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" bash -s << SUDOEOF
 set -euo pipefail
-_SUDO_B64="${SUDO_B64}"
+_SUDO_B64="${_b64}"
 if [[ -n "\${_SUDO_B64}" ]]; then
     printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' ${cmd}
 else
@@ -292,28 +293,87 @@ PUB_KEY=$(cat "${KEY_PATH}.pub")
 PRIVKEY_B64=$(base64 -w0 "${KEY_PATH}")
 PUBKEY_B64=$(base64 -w0 "${KEY_PATH}.pub")
 
-# ── Sudo password (asked once, reused for all remote servers) ─────────────────
-_sudo_pass=""
-# '|| true': read returns non-zero on EOF (e.g. stdin </dev/null in a
-# non-interactive run) and set -e would silently kill the script here;
-# an empty password falls through to the passwordless-sudo path.
-read -rsp "[PROMPT] Sudo password for remote servers (press Enter if passwordless): " _sudo_pass || true
+# ── Sudo passwords (prompted per server, verified before any changes) ─────────
+# Each admin@host has its own sudo password, stored base64-encoded and keyed by
+# the exact admin@host connection string. Every password is verified over SSH
+# immediately after entry, so a wrong password fails fast here — before the
+# script has modified anything on any server.
+declare -A SUDO_B64_BY_HOST
+
+# Verify sudo access on <admin@host> with the given base64-encoded password
+# (empty = passwordless sudo). The password travels on stdin — never on a
+# command line. 'sudo -k' discards any cached sudo timestamp so the password
+# itself is tested, not a stale credential cache.
+_verify_sudo() {
+    local conn="$1" b64="$2"
+    if [[ -n "${b64}" ]]; then
+        printf '%s\n' "${b64}" | ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" \
+            'IFS= read -r _b; printf "%s\n" "$(printf "%s" "${_b}" | base64 -d)" | sudo -S -p "" -k true 2>/dev/null'
+    else
+        ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" 'sudo -n -k true 2>/dev/null'
+    fi
+}
+
+_ALL_CONNS=("${BACKUP_USER}@${BACKUP_HOST}")
+for i in "${!SOURCE_SERVERS[@]}"; do
+    _ALL_CONNS+=("${SOURCE_USERS[$i]}@${SOURCE_SERVERS[$i]}")
+done
+
 echo ""
-SUDO_B64=$(printf '%s' "${_sudo_pass}" | base64 -w0)
-unset _sudo_pass
+echo "[INFO] Collecting sudo passwords (one per server, verified immediately)..."
+for _conn in "${_ALL_CONNS[@]}"; do
+    # Deduplicate: the same admin@host may appear as both backup and source
+    [[ -n "${SUDO_B64_BY_HOST[${_conn}]+x}" ]] && continue
+    _VERIFIED=false
+    for _attempt in 1 2 3; do
+        _sudo_pass=""
+        # '|| true': read returns non-zero on EOF (e.g. stdin </dev/null in a
+        # non-interactive run) and set -e would silently kill the script here;
+        # an empty password is verified as the passwordless-sudo path.
+        read -rsp "[PROMPT] Sudo password for ${_conn} (press Enter if passwordless): " _sudo_pass || true
+        echo ""
+        _b64=$(printf '%s' "${_sudo_pass}" | base64 -w0)
+        unset _sudo_pass
+        _rc=0
+        _verify_sudo "${_conn}" "${_b64}" || _rc=$?
+        if [[ ${_rc} -eq 0 ]]; then
+            SUDO_B64_BY_HOST[${_conn}]="${_b64}"
+            echo "[OK] Sudo verified on ${_conn}."
+            _VERIFIED=true
+            break
+        elif [[ ${_rc} -eq 255 ]]; then
+            # 255 is ssh's own exit code (connection/auth failure) — the sudo
+            # password was never tested, so retrying it would be misleading.
+            echo "[ERROR] SSH connection to ${_conn} failed — cannot verify sudo." >&2
+            exit 1
+        fi
+        if [[ -z "${_b64}" ]]; then
+            echo "[WARN] Passwordless sudo not available on ${_conn} (attempt ${_attempt}/3)."
+        else
+            echo "[WARN] Sudo password rejected by ${_conn} (attempt ${_attempt}/3)."
+        fi
+    done
+    if ! ${_VERIFIED}; then
+        echo "[ERROR] Could not verify sudo on ${_conn} after 3 attempts — aborting before touching any server." >&2
+        exit 1
+    fi
+done
+
+# Convenience handles used by the remote heredocs below
+SUDO_B64_BACKUP="${SUDO_B64_BY_HOST[${BACKUP_USER}@${BACKUP_HOST}]}"
 
 # ── 2. Set up recsyncoid on the backup server ─────────────────────────────────
 echo ""
 echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
 
-# shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64, keys, usernames; remote vars are \$-escaped
+# shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password, keys, usernames; remote vars are \$-escaped
 ssh -T "${SSH_CTL[@]}" "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
     2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
     << BACKUPEOF
 set -euo pipefail
 
-_SUDO_B64="${SUDO_B64}"
+_SUDO_B64="${SUDO_B64_BACKUP}"
 _sudo() {
     if [[ -n "\${_SUDO_B64}" ]]; then
         printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
@@ -412,6 +472,7 @@ FROM_IP=""         # ditto — must be initialised: the source-server heredoc ex
 for i in "${!SOURCE_SERVERS[@]}"; do
     HOST="${SOURCE_SERVERS[$i]}"
     SOURCE_ADMIN_USER="${SOURCE_USERS[$i]}"
+    SUDO_B64_SRC="${SUDO_B64_BY_HOST[${SOURCE_ADMIN_USER}@${HOST}]}"
     echo ""
     echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${SOURCE_ADMIN_USER})..."
 
@@ -440,14 +501,14 @@ for i in "${!SOURCE_SERVERS[@]}"; do
         AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
     fi
 
-    # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64, keys, from= entry; remote vars are \$-escaped
+    # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password, keys, from= entry; remote vars are \$-escaped
     ssh -T "${SSH_CTL[@]}" "${SOURCE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << SOURCEEOF
 set -euo pipefail
 command -v bash > /dev/null || { echo "[ERROR] bash not found on ${HOST}"; exit 1; }
 
-_SUDO_B64="${SUDO_B64}"
+_SUDO_B64="${SUDO_B64_SRC}"
 _sudo() {
     if [[ -n "\${_SUDO_B64}" ]]; then
         printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
@@ -615,12 +676,12 @@ SOURCEEOF
         # from the backup server itself (the machine that will connect), so
         # it's the same TOFU trade-off as the rest of the setup.
         echo "[INFO] Seeding ${HOST}'s host key into ${REC_USER}'s known_hosts on ${BACKUP_HOST}..."
-        # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64 and host names; remote vars are \$-escaped
+        # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password and host names; remote vars are \$-escaped
         ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << KNOWNHOSTSEOF
 set -euo pipefail
-_SUDO_B64="${SUDO_B64}"
+_SUDO_B64="${SUDO_B64_BACKUP}"
 _sudo() {
     if [[ -n "\${_SUDO_B64}" ]]; then
         printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
@@ -674,12 +735,12 @@ KNOWNHOSTSEOF
 
         # Deploy public key to recsyncoid's authorized_keys on the backup server
         echo "[INFO] Deploying public key to ${REC_USER}@${BACKUP_HOST} (from=${SOURCE_IP})..."
-        # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64 and the from= auth entry; remote vars are \$-escaped
+        # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password and the from= auth entry; remote vars are \$-escaped
         ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << PUSHKEYEOF
 set -euo pipefail
-_SUDO_B64="${SUDO_B64}"
+_SUDO_B64="${SUDO_B64_BACKUP}"
 _sudo() {
     if [[ -n "\${_SUDO_B64}" ]]; then
         printf '%s\n' "\$(printf '%s' "\${_SUDO_B64}" | base64 -d)" | sudo -S -p '' "\$@"
