@@ -89,7 +89,7 @@ The setup phase is idempotent: existing keys and `authorized_keys` entries are d
 
 After setup, the script immediately walks you through generating `syncoid` commands:
 
-1. **Dataset selection** — lists ZFS datasets on each source server (fetched via your admin SSH session); select by number, range (`1-3`), comma-separated (`1,3,5`), or `a` for all. Child datasets whose parent is also selected are suppressed automatically, and the parent command gets `--recursive`.
+1. **Dataset selection** — lists ZFS datasets on each source server (fetched via your admin SSH session); select by number, range (`1-3`), comma-separated (`1,3,5`), or `a` for all. Child datasets whose parent is also selected are suppressed automatically, and the parent command gets `--recursive`. If a selected dataset has children that were *not* selected, the wizard asks whether to include them recursively (default yes).
 2. **Destination** — shows ZFS datasets on the backup server as a numbered menu for the destination parent; then prompts for a middle path component (default: `backup`). The default full destination preserves the entire source path (`<parent>/<middle>/<full-source-path>`, e.g. `tank/backup/rpool/data/www`) to avoid collisions between pools. Each destination can be overridden per dataset — a bare name renames only the leaf, a path with a slash replaces the full destination. Missing intermediate datasets are pre-created (`zfs create -p`), since `zfs receive` cannot create them.
 3. **Encryption** — for encrypted datasets you choose raw receive (`--sendoptions=w`, keeps encryption on the backup server, recommended) or decrypted receive. Detection is descendant-aware: an encrypted child of an unencrypted parent still triggers raw receive when the parent is sent recursively.
 
@@ -164,7 +164,7 @@ The script runs on your management machine — the backup server never holds adm
 
 Both syncoid accounts have a **locked password** and are reachable only via the restricted SSH key. Each `authorized_keys` entry carries `restrict` (no port/agent/X11 forwarding, no pty) plus `from=<ip>` pinning the connection to the peer's real source address.
 
-**No `command=` restriction (deliberate).** Because syncoid's `zfs` invocations vary, pinning them with `command=` is fragile, so it is intentionally omitted. As a result, possession of the private key **plus** the ability to present the pinned `from=` IP is enough to run commands as these users — including the delegated `zfs destroy` (`sendsyncoid` gets `send,snapshot,hold,destroy`; `recsyncoid` gets `receive,create,mount,rollback,destroy,compression`). The `from=` IP is the only network control and is spoofable on a flat L2 segment; the primary mitigation is that the private key is mode `600` under a password-locked account. This is a documented trade-off, not an oversight.
+**No `command=` restriction (deliberate).** Because syncoid's `zfs` invocations vary, pinning them with `command=` is fragile, so it is intentionally omitted. As a result, possession of the private key **plus** the ability to present the pinned `from=` IP is enough to run commands as these users — including the delegated `zfs destroy` (`sendsyncoid` gets `send,snapshot,hold,destroy,mount`; `recsyncoid` gets `receive,create,mount,rollback,destroy,compression`). The `from=` IP is the only network control and is spoofable on a flat L2 segment; the primary mitigation is that the private key is mode `600` under a password-locked account. This is a documented trade-off, not an oversight.
 
 ### Source-IP restriction
 

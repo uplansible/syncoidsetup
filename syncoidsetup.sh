@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.32
+# syncoidsetup.sh — v0.2.34
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all source servers.
 #
@@ -711,8 +711,11 @@ fi
 # /dev/zfs is root-only, which would silently skip the delegation.
 _FOUND_POOL=false
 for _pool in \$(_sudo zfs list -H -o name -d 0 2>/dev/null || true); do
-    _sudo zfs allow -u "${SEND_USER}" send,snapshot,hold,destroy "\${_pool}"
-    echo "[OK] ZFS permissions (send,snapshot,hold,destroy) granted to ${SEND_USER} on \${_pool}"
+    # 'mount' is required alongside 'destroy' — zfs delegation docs: "destroy —
+    # Must also have the mount ability" — or syncoid's snapshot pruning fails
+    # with "cannot destroy snapshots: permission denied".
+    _sudo zfs allow -u "${SEND_USER}" send,snapshot,hold,destroy,mount "\${_pool}"
+    echo "[OK] ZFS permissions (send,snapshot,hold,destroy,mount) granted to ${SEND_USER} on \${_pool}"
     _FOUND_POOL=true
 done
 if ! \${_FOUND_POOL}; then
@@ -1089,6 +1092,26 @@ for i in "${!SOURCE_SERVERS[@]}"; do
         echo "└──────────────────────────────────────────────────────────"
         continue
     }
+
+    # A selected dataset may have children that were never selected — without
+    # --recursive syncoid silently replicates only the parent. Offer recursion
+    # explicitly (default yes) so children aren't dropped by accident.
+    for ds in "${FILTERED_NAMES[@]}"; do
+        _already=false
+        for _rp in "${RECURSIVE_PARENTS[@]}"; do
+            [[ "${_rp}" == "${ds}" ]] && _already=true && break
+        done
+        ${_already} && continue
+        _has_child=false
+        for ((j=0; j<${#DS_NAMES[@]}; j++)); do
+            [[ "${DS_NAMES[$j]}" == "${ds}/"* ]] && _has_child=true && break
+        done
+        ${_has_child} || continue
+        read -r -p "│  '${ds}' has child datasets — include them (--recursive)? [Y/n] " _REC_ANS || true
+        if [[ ! "${_REC_ANS}" =~ ^[nN] ]]; then
+            RECURSIVE_PARENTS+=("${ds}")
+        fi
+    done
 
     # Determine encryption policy for this host. A dataset selected as a recursive
     # parent is checked for encrypted descendants too (see wizard_is_encrypted).
