@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # syncoidsetup.sh — v0.2.27
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
-# Requires SSH access (with sudo rights) to both the backup server and all prod servers.
+# Requires SSH access (with sudo rights) to both the backup server and all source servers.
 #
 # Usage:
 #   ./syncoidsetup.sh [--push] [--site <name>] --backup [backupuser@]backuphost \
-#                     --remote [remoteuser@]remotehost \
-#                     [--remote [remoteuser2@]remotehost2 ...]
+#                     --source [sourceuser@]sourcehost \
+#                     [--source [sourceuser2@]sourcehost2 ...]
 #
-# --push          Push mode: syncoid runs on each prod server and pushes to the backup server.
-#                 Use when prod servers are intermittently online (default: pull mode, backup pulls).
+# --push          Push mode: syncoid runs on each source server and pushes to the backup server.
+#                 Use when source servers are intermittently online (default: pull mode, backup pulls).
 # --password-auth Force password auth for admin SSH (no pubkey). Use when many keys in agent
 #                 cause 'too many authentication failures'.
 # --site   Optional. Defaults to the backup server's short hostname.
-# user@    Optional for both --backup and --remote; defaults to $USER.
+# user@    Optional for both --backup and --source; defaults to $USER.
 #
 # Examples:
-#   ./syncoidsetup.sh --backup admin@100.64.0.10 --remote ubuntu@100.64.0.1
-#   ./syncoidsetup.sh --push --backup ma@100.88.1.4 --remote nobi@100.103.188.87
+#   ./syncoidsetup.sh --backup admin@100.64.0.10 --source ubuntu@100.64.0.1
+#   ./syncoidsetup.sh --push --backup ma@100.88.1.4 --source nobi@100.103.188.87
 #   ./syncoidsetup.sh --site homelab --backup 100.64.0.10 \
-#                     --remote ubuntu@100.64.0.1 --remote root@100.64.0.2
+#                     --source ubuntu@100.64.0.1 --source root@100.64.0.2
 #
 # Portability requirements (script runs on the management machine):
 #   base64 -w0  requires GNU coreutils (Linux default). macOS: brew install coreutils
@@ -40,7 +40,7 @@
 #     the shared sudo password. The script warns for any host missing from known_hosts.
 #   - The syncoid users' known_hosts files are pre-seeded via ssh-keyscan so the first
 #     unattended replication run isn't blocked by the host-key prompt. The keyscan runs
-#     from the machine that will connect (backup server in pull mode, prod in push mode),
+#     from the machine that will connect (backup server in pull mode, source server in push mode),
 #     so it is the same trust-on-first-use trade-off as the setup connection itself.
 #   - authorized_keys entries use 'restrict' + 'from=<ip>' but deliberately NO 'command='
 #     (pinning syncoid's variable zfs invocations is fragile). Combined with the ZFS
@@ -57,14 +57,14 @@ REC_USER="recsyncoid"
 # ─────────────────────────────────────────────────────────────────────────────
 
 usage() {
-    echo "Usage: $0 [--push] [--site <name>] --backup [user@]host --remote [user@]host [--remote [user@]host2 ...]"
-    echo "       --push          Push mode: syncoid runs on each prod server and pushes to the backup server."
-    echo "                       Use when prod servers are intermittently online."
+    echo "Usage: $0 [--push] [--site <name>] --backup [user@]host --source [user@]host [--source [user@]host2 ...]"
+    echo "       --push          Push mode: syncoid runs on each source server and pushes to the backup server."
+    echo "                       Use when source servers are intermittently online."
     echo "       --password-auth Force password authentication for admin SSH connections (no public key)."
     echo "                       Use when you have many keys in your agent causing 'too many auth failures'."
     echo "       --site     Optional. Site name for this backup set (defaults to the backup server's short hostname)."
     echo "       --backup   Backup server in [user@]host format (user defaults to \$USER)."
-    echo "       --remote   Production server(s) in [user@]host format (user defaults to \$USER). Repeatable."
+    echo "       --source   Source server(s) in [user@]host format (user defaults to \$USER). Repeatable."
     exit 1
 }
 
@@ -73,8 +73,8 @@ usage() {
 SITE_NAME=""
 BACKUP_HOST=""
 BACKUP_USER=""
-PROD_SERVERS=()
-PROD_USERS=()
+SOURCE_SERVERS=()
+SOURCE_USERS=()
 PUSH_MODE=false
 PASSWORD_AUTH=false
 
@@ -103,11 +103,11 @@ while [[ $# -gt 0 ]]; do
             BACKUP_USER="${_SPLIT_USER}"
             BACKUP_HOST="${_SPLIT_HOST}"
             shift 2 ;;
-        --remote)
-            [[ $# -ge 2 && "$2" != --* ]] || { echo "[ERROR] --remote requires a [user@]host value." >&2; usage; }
+        --source)
+            [[ $# -ge 2 && "$2" != --* ]] || { echo "[ERROR] --source requires a [user@]host value." >&2; usage; }
             split_userhost "$2"
-            PROD_USERS+=("${_SPLIT_USER}")
-            PROD_SERVERS+=("${_SPLIT_HOST}")
+            SOURCE_USERS+=("${_SPLIT_USER}")
+            SOURCE_SERVERS+=("${_SPLIT_HOST}")
             shift 2 ;;
         --push) PUSH_MODE=true; shift ;;
         --password-auth) PASSWORD_AUTH=true; shift ;;
@@ -131,7 +131,7 @@ if [[ -z "${SITE_NAME}" ]]; then
     fi
 fi
 [[ -z "${BACKUP_HOST}" ]] && { echo "[ERROR] --backup [user@]host is required." >&2; usage; }
-[[ ${#PROD_SERVERS[@]} -eq 0 ]] && { echo "[ERROR] At least one --remote [user@]host is required." >&2; usage; }
+[[ ${#SOURCE_SERVERS[@]} -eq 0 ]] && { echo "[ERROR] At least one --source [user@]host is required." >&2; usage; }
 
 # ── Input validation ──────────────────────────────────────────────────────────
 if [[ ! "${SITE_NAME}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -144,7 +144,7 @@ if [[ ! "${BACKUP_HOST}" =~ ^[][a-zA-Z0-9._:-]+$ ]]; then
     exit 1
 fi
 
-for SERVER in "${PROD_SERVERS[@]}"; do
+for SERVER in "${SOURCE_SERVERS[@]}"; do
     if [[ ! "${SERVER}" =~ ^[][a-zA-Z0-9._:-]+$ ]]; then
         echo "[ERROR] Invalid server '${SERVER}': only letters, digits, '.', '_', ':', '[', ']', and '-' are allowed." >&2
         exit 1
@@ -153,8 +153,8 @@ done
 
 # Reject hosts starting with '-' (would be misinterpreted as ssh/nc option flags)
 [[ "${BACKUP_HOST}" != -* ]] || { echo "[ERROR] Backup host must not start with '-'." >&2; exit 1; }
-for SERVER in "${PROD_SERVERS[@]}"; do
-    [[ "${SERVER}" != -* ]] || { echo "[ERROR] Remote host '${SERVER}' must not start with '-'." >&2; exit 1; }
+for SERVER in "${SOURCE_SERVERS[@]}"; do
+    [[ "${SERVER}" != -* ]] || { echo "[ERROR] Source host '${SERVER}' must not start with '-'." >&2; exit 1; }
 done
 
 # Validate admin usernames
@@ -164,12 +164,12 @@ _validate_user() {
     }
 }
 _validate_user "${BACKUP_USER}"
-for _u in "${PROD_USERS[@]}"; do _validate_user "${_u}"; done
+for _u in "${SOURCE_USERS[@]}"; do _validate_user "${_u}"; done
 
 # ── TCP reachability pre-check ────────────────────────────────────────────────
 # Checks port 22 only — does not test SSH authentication.
 echo "[INFO] Checking TCP reachability of all servers (port 22)..."
-ALL_HOSTS=("${BACKUP_HOST}" "${PROD_SERVERS[@]}")
+ALL_HOSTS=("${BACKUP_HOST}" "${SOURCE_SERVERS[@]}")
 for SERVER in "${ALL_HOSTS[@]}"; do
     if command -v nc > /dev/null 2>&1; then
         if ! nc -z -w 5 "${SERVER}" 22 2>/dev/null; then
@@ -210,16 +210,16 @@ if [[ -n "${BACKUP_IP:-}" ]]; then
     echo "[INFO] Using pre-set BACKUP_IP=${BACKUP_IP}"
 fi
 
-# Push-mode counterpart: PROD_IP overrides the resolved outbound IP of every
-# prod server for the from= restriction on the backup side (applies to all prods).
-if [[ -n "${PROD_IP:-}" ]]; then
-    [[ "${PROD_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${PROD_IP}" != -* ]] || {
-        echo "[ERROR] Invalid PROD_IP='${PROD_IP}': must contain only alphanumerics, ':', '.', '/', '-'." >&2
+# Push-mode counterpart: SOURCE_IP overrides the resolved outbound IP of every
+# source server for the from= restriction on the backup side (applies to all source servers).
+if [[ -n "${SOURCE_IP:-}" ]]; then
+    [[ "${SOURCE_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${SOURCE_IP}" != -* ]] || {
+        echo "[ERROR] Invalid SOURCE_IP='${SOURCE_IP}': must contain only alphanumerics, ':', '.', '/', '-'." >&2
         exit 1
     }
-    echo "[INFO] Using pre-set PROD_IP=${PROD_IP}"
+    echo "[INFO] Using pre-set SOURCE_IP=${SOURCE_IP}"
 fi
-PROD_IP_OVERRIDE="${PROD_IP:-}"
+SOURCE_IP_OVERRIDE="${SOURCE_IP:-}"
 
 # ── SSH ControlMaster — one TCP connection per host, reused for all SSH calls ──
 _CTLDIR=$(mktemp -d)
@@ -340,7 +340,7 @@ _sudo chmod 700 "\${REM_SSH_DIR}"
 _sudo chown "${REC_USER}:${REC_USER}" "\${REM_SSH_DIR}"
 
 if [[ "${PUSH_MODE}" == "false" ]]; then
-    # Pull mode: private key lives on the backup server (recsyncoid initiates SSH to prod)
+    # Pull mode: private key lives on the backup server (recsyncoid initiates SSH to the source server)
     if _sudo test -f "\${REM_KEY_PATH}"; then
         _sudo cp "\${REM_KEY_PATH}" "\${REM_KEY_PATH}.bak"
         echo "[WARN] Existing private key backed up to \${REM_KEY_PATH}.bak"
@@ -358,7 +358,7 @@ if [[ "${PUSH_MODE}" == "false" ]]; then
 fi
 
 if command -v usermod > /dev/null; then
-    # Push mode: recsyncoid must accept incoming SSH commands from prod servers — needs /bin/sh.
+    # Push mode: recsyncoid must accept incoming SSH commands from source servers — needs /bin/sh.
     # Pull mode: recsyncoid only initiates outbound connections — nologin is sufficient.
     # But never downgrade an existing /bin/sh to nologin: a push-mode site configured
     # earlier on this backup server depends on it for incoming SSH commands.
@@ -394,22 +394,22 @@ REC_SSH_DIR="${REC_HOME}/.ssh"
 REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 
 # ── 3. from= source-IP restriction ────────────────────────────────────────────
-# Resolved per prod server inside the loop below — the backup server's outbound
-# IP can differ per prod (e.g. one reached via LAN, another via VPN), so a single
-# shared from= would lock out every prod except the one it was probed against.
-# The BACKUP_IP env var overrides resolution and applies to all prods.
+# Resolved per source server inside the loop below — the backup server's outbound
+# IP can differ per source server (e.g. one reached via LAN, another via VPN), so a single
+# shared from= would lock out every source server except the one it was probed against.
+# The BACKUP_IP env var overrides resolution and applies to all source servers.
 AUTH_ENTRY_B64=""  # rebuilt per host in the loop below (pull mode only)
 
-# ── 4. Push public key to each production server via SSH ──────────────────────
-for i in "${!PROD_SERVERS[@]}"; do
-    HOST="${PROD_SERVERS[$i]}"
-    REMOTE_ADMIN_USER="${PROD_USERS[$i]}"
+# ── 4. Push public key to each source server via SSH ──────────────────────────
+for i in "${!SOURCE_SERVERS[@]}"; do
+    HOST="${SOURCE_SERVERS[$i]}"
+    SOURCE_ADMIN_USER="${SOURCE_USERS[$i]}"
     echo ""
-    echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${REMOTE_ADMIN_USER})..."
+    echo "[INFO] Deploying key to ${SEND_USER}@${HOST} (connecting as ${SOURCE_ADMIN_USER})..."
 
     if [[ "${PUSH_MODE}" == "false" ]]; then
-        # Pull mode: resolve the backup server's outbound IP toward *this* prod
-        # for the from= restriction in this prod's authorized_keys entry.
+        # Pull mode: resolve the backup server's outbound IP toward *this* source server
+        # for the from= restriction in this source server's authorized_keys entry.
         if [[ -n "${BACKUP_IP:-}" ]]; then
             FROM_IP="${BACKUP_IP}"
         else
@@ -432,9 +432,9 @@ for i in "${!PROD_SERVERS[@]}"; do
         AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
     fi
 
-    ssh -T "${SSH_CTL[@]}" "${REMOTE_ADMIN_USER}@${HOST}" bash -s \
+    ssh -T "${SSH_CTL[@]}" "${SOURCE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
-        << REMOTEEOF
+        << SOURCEEOF
 set -euo pipefail
 command -v bash > /dev/null || { echo "[ERROR] bash not found on ${HOST}"; exit 1; }
 
@@ -456,7 +456,7 @@ if ! command -v sanoid > /dev/null; then
     echo "       Install sanoid and configure a snapshot policy before relying on replication."
 fi
 
-# In push mode syncoid runs on the prod server; verify it is installed
+# In push mode syncoid runs on the source server; verify it is installed
 if [[ "${PUSH_MODE}" == "true" ]]; then
     command -v syncoid > /dev/null || {
         echo "[WARN] syncoid not found on \$(hostname) — install it before running push-mode replication."
@@ -546,7 +546,7 @@ else
 
     # Pre-seed the backup server's host key into sendsyncoid's known_hosts —
     # push runs happen under cron/systemd, where the interactive host-key
-    # prompt would kill the first replication. Keyscan from this prod server
+    # prompt would kill the first replication. Keyscan from this source server
     # (the machine that will connect) is the same TOFU trade-off as the rest
     # of the setup.
     KNOWN_HOSTS="\${SSH_DIR}/known_hosts"
@@ -567,7 +567,7 @@ else
     fi
 fi
 
-# Harden remote sendsyncoid account
+# Harden sendsyncoid account
 # Shell must be /bin/sh (not nologin) — sshd runs commands via the shell,
 # and nologin ignores -c, blocking all SSH command execution.
 # Security is enforced by the authorized_keys restrict+from= restrictions.
@@ -597,10 +597,10 @@ if ! \${_FOUND_POOL}; then
 fi
 
 echo "[OK] ${SEND_USER} hardened on \$(hostname)"
-REMOTEEOF
+SOURCEEOF
 
     if [[ "${PUSH_MODE}" == "false" ]]; then
-        # Pre-seed this prod's host key into recsyncoid's known_hosts on the
+        # Pre-seed this source server's host key into recsyncoid's known_hosts on the
         # backup server — the first syncoid run happens under cron/systemd,
         # where the interactive host-key prompt would kill it. Keyscan runs
         # from the backup server itself (the machine that will connect), so
@@ -639,31 +639,31 @@ KNOWNHOSTSEOF
     fi
 
     if [[ "${PUSH_MODE}" == "true" ]]; then
-        # Push mode: resolve the prod server's outbound IP toward the backup server,
+        # Push mode: resolve the source server's outbound IP toward the backup server,
         # then install the public key into recsyncoid's authorized_keys on the backup server.
-        if [[ -n "${PROD_IP_OVERRIDE}" ]]; then
-            PROD_IP="${PROD_IP_OVERRIDE}"
+        if [[ -n "${SOURCE_IP_OVERRIDE}" ]]; then
+            SOURCE_IP="${SOURCE_IP_OVERRIDE}"
         else
             echo "[INFO] Resolving ${HOST}'s outbound IP toward ${BACKUP_HOST}..."
-            PROD_IP=$(_resolve_outbound_ip "${PROD_USERS[$i]}@${HOST}" "${BACKUP_HOST}")
-            if [[ -z "${PROD_IP}" ]]; then
+            SOURCE_IP=$(_resolve_outbound_ip "${SOURCE_USERS[$i]}@${HOST}" "${BACKUP_HOST}")
+            if [[ -z "${SOURCE_IP}" ]]; then
                 echo "[ERROR] Could not determine ${HOST}'s outgoing IP for from= restriction." >&2
-                echo "        Set PROD_IP=<ip> in the environment to override." >&2
+                echo "        Set SOURCE_IP=<ip> in the environment to override." >&2
                 exit 1
             fi
-            [[ "${PROD_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${PROD_IP}" != -* ]] || {
-                echo "[ERROR] Resolved PROD_IP='${PROD_IP}' for ${HOST} is not a valid address." >&2
-                echo "        Set PROD_IP=<ip> in the environment to override." >&2
+            [[ "${SOURCE_IP}" =~ ^[a-zA-Z0-9:._/-]+$ && "${SOURCE_IP}" != -* ]] || {
+                echo "[ERROR] Resolved SOURCE_IP='${SOURCE_IP}' for ${HOST} is not a valid address." >&2
+                echo "        Set SOURCE_IP=<ip> in the environment to override." >&2
                 exit 1
             }
         fi
-        echo "[INFO] ${HOST} outbound IP for from= restriction: ${PROD_IP}"
+        echo "[INFO] ${HOST} outbound IP for from= restriction: ${SOURCE_IP}"
 
-        PUSH_AUTH_ENTRY="restrict,from=\"${PROD_IP}\" ${PUB_KEY}"
+        PUSH_AUTH_ENTRY="restrict,from=\"${SOURCE_IP}\" ${PUB_KEY}"
         PUSH_AUTH_ENTRY_B64=$(printf '%s' "${PUSH_AUTH_ENTRY}" | base64 -w0)
 
         # Deploy public key to recsyncoid's authorized_keys on the backup server
-        echo "[INFO] Deploying public key to ${REC_USER}@${BACKUP_HOST} (from=${PROD_IP})..."
+        echo "[INFO] Deploying public key to ${REC_USER}@${BACKUP_HOST} (from=${SOURCE_IP})..."
         ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << PUSHKEYEOF
@@ -680,27 +680,27 @@ REC_HOME=\$(getent passwd "${REC_USER}" | cut -d: -f6)
 SSH_DIR="\${REC_HOME}/.ssh"
 AUTH_FILE="\${SSH_DIR}/authorized_keys"
 
-# Check if an entry with this exact PROD_IP + public key already exists.
-# Multiple prod servers share the same keypair but each has its own from= IP,
+# Check if an entry with this exact SOURCE_IP + public key already exists.
+# Multiple source servers share the same keypair but each has its own from= IP,
 # so we match on both the key and the full quoted from="IP" token — a bare
 # substring match would false-positive on prefixes (10.0.0.1 vs 10.0.0.11).
 ALREADY_PRESENT=false
 if _sudo test -f "\${AUTH_FILE}"; then
     # grep without -q on the pipe tail: -q's early exit would SIGPIPE the first
     # grep and fail the pipeline under pipefail despite a real match.
-    if _sudo grep -F "${PUB_KEY}" "\${AUTH_FILE}" 2>/dev/null | grep -F "from=\"${PROD_IP}\"" > /dev/null; then
+    if _sudo grep -F "${PUB_KEY}" "\${AUTH_FILE}" 2>/dev/null | grep -F "from=\"${SOURCE_IP}\"" > /dev/null; then
         ALREADY_PRESENT=true
     fi
 fi
 
 if \${ALREADY_PRESENT}; then
-    echo "[INFO] Key with from=${PROD_IP} already present in \${AUTH_FILE}, skipping."
+    echo "[INFO] Key with from=${SOURCE_IP} already present in \${AUTH_FILE}, skipping."
 else
     TMPAUTH=\$(mktemp)
     printf '%s\n' "\$(printf '%s' "${PUSH_AUTH_ENTRY_B64}" | base64 -d)" > "\${TMPAUTH}"
     _sudo bash -c 'cat "\$1" >> "\$2"' -- "\${TMPAUTH}" "\${AUTH_FILE}"
     rm -f "\${TMPAUTH}"
-    echo "[OK] Key (from=${PROD_IP}) appended to \${AUTH_FILE}"
+    echo "[OK] Key (from=${SOURCE_IP}) appended to \${AUTH_FILE}"
 fi
 
 _sudo chmod 600 "\${AUTH_FILE}"
@@ -717,21 +717,21 @@ echo "════════════════════════�
 echo " Setup complete for site: ${SITE_NAME}"
 echo " Key (this machine): ${KEY_PATH}"
 if [[ "${PUSH_MODE}" == "true" ]]; then
-    echo " Key (each prod server, ${SEND_USER}): ~/.ssh/id_ed25519_${SITE_NAME}_syncoid"
-    echo " Deployed to: ${PROD_SERVERS[*]}"
+    echo " Key (each source server, ${SEND_USER}): ~/.ssh/id_ed25519_${SITE_NAME}_syncoid"
+    echo " Deployed to: ${SOURCE_SERVERS[*]}"
     echo ""
-    echo " Generic syncoid template (run on each prod server as ${SEND_USER}):"
+    echo " Generic syncoid template (run on each source server as ${SEND_USER}):"
     echo "   sudo -H -u ${SEND_USER} bash -c \\"
     # \$HOME (not ~): tilde does not expand in a command argument after '=';
     # $HOME expands in the inner bash, where sudo -H has set it to the target user's home.
     echo "     'syncoid --no-privilege-elevation --sshkey=\$HOME/.ssh/id_ed25519_${SITE_NAME}_syncoid pool/dataset ${REC_USER}@${BACKUP_HOST}:pool/backup/${SITE_NAME}/dataset'"
 else
     echo " Key (backup server ${BACKUP_HOST}): ${REC_KEY_PATH}"
-    echo " Deployed to: ${PROD_SERVERS[*]}"
+    echo " Deployed to: ${SOURCE_SERVERS[*]}"
     echo ""
     echo " Generic syncoid template (run on ${BACKUP_HOST}):"
     echo "   sudo -H -u ${REC_USER} bash -c \\"
-    echo "     'syncoid --no-privilege-elevation --sshkey=${REC_KEY_PATH} ${SEND_USER}@<prod-host>:pool/dataset pool/backup/${SITE_NAME}/dataset'"
+    echo "     'syncoid --no-privilege-elevation --sshkey=${REC_KEY_PATH} ${SEND_USER}@<source-host>:pool/dataset pool/backup/${SITE_NAME}/dataset'"
 fi
 echo "════════════════════════════════════════════════════════"
 
@@ -743,7 +743,7 @@ if [[ ! -t 0 ]]; then
     echo "[INFO]       Run the script interactively, or manually run on ${BACKUP_HOST}:"
     echo "[INFO]         sudo zfs allow -u ${REC_USER} receive,create,mount,rollback,destroy,compression <dest-parent>"
     if [[ "${PUSH_MODE}" == "true" ]]; then
-        echo "[INFO] Push mode: generated commands run on each prod server, not on the backup server."
+        echo "[INFO] Push mode: generated commands run on each source server, not on the backup server."
     fi
     exit 0
 fi
@@ -845,17 +845,17 @@ mapfile -t LOCAL_DATASETS < <(
 
 ALL_CMDS=()  # accumulates all generated commands across hosts
 
-for i in "${!PROD_SERVERS[@]}"; do
-    HOST="${PROD_SERVERS[$i]}"
-    REMOTE_ADMIN_USER="${PROD_USERS[$i]}"
+for i in "${!SOURCE_SERVERS[@]}"; do
+    HOST="${SOURCE_SERVERS[$i]}"
+    SOURCE_ADMIN_USER="${SOURCE_USERS[$i]}"
 
     echo ""
     echo "┌─ Host: ${HOST} ──────────────────────────────────────────"
 
-    # In push mode, resolve sendsyncoid's home on this prod server to build the key path
+    # In push mode, resolve sendsyncoid's home on this source server to build the key path
     SEND_KEY_PATH=""
     if [[ "${PUSH_MODE}" == "true" ]]; then
-        _SEND_HOME=$(ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${REMOTE_ADMIN_USER}@${HOST}" \
+        _SEND_HOME=$(ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${SOURCE_ADMIN_USER}@${HOST}" \
             "getent passwd '${SEND_USER}' | cut -d: -f6" 2>/dev/null || true)
         if [[ -z "${_SEND_HOME}" ]]; then
             echo "│ [WARN] Could not determine ${SEND_USER} home on ${HOST} — key path may be incorrect."
@@ -864,18 +864,18 @@ for i in "${!PROD_SERVERS[@]}"; do
         SEND_KEY_PATH="${_SEND_HOME}/.ssh/id_ed25519_${SITE_NAME}_syncoid"
     fi
 
-    # Fetch remote dataset list via admin SSH (the syncoid key's from= restriction
+    # Fetch source dataset list via admin SSH (the syncoid key's from= restriction
     # blocks the management machine from using it). Via _ssh_sudo so listing also
     # works where plain zfs list fails for non-root.
-    mapfile -t REMOTE_LINES < <(
-        _ssh_sudo "${REMOTE_ADMIN_USER}@${HOST}" zfs list -H -r -o name,encryption,keystatus 2>/dev/null || true
+    mapfile -t SOURCE_LINES < <(
+        _ssh_sudo "${SOURCE_ADMIN_USER}@${HOST}" zfs list -H -r -o name,encryption,keystatus 2>/dev/null || true
     )
 
     DS_NAMES=()
     DS_ENCS=()
 
-    if [[ ${#REMOTE_LINES[@]} -eq 0 ]]; then
-        echo "│ [WARN] Could not list remote datasets (no sudo access or zfs unavailable)."
+    if [[ ${#SOURCE_LINES[@]} -eq 0 ]]; then
+        echo "│ [WARN] Could not list source datasets (no sudo access or zfs unavailable)."
         read -r -p "│ Enter dataset path manually (or press Enter to skip): " MANUAL_DS || true
         if [[ -z "${MANUAL_DS}" ]]; then
             echo "│ Skipping ${HOST}."
@@ -890,7 +890,7 @@ for i in "${!PROD_SERVERS[@]}"; do
         DS_NAMES+=("${MANUAL_DS}")
         DS_ENCS+=("unknown")
     else
-        for line in "${REMOTE_LINES[@]}"; do
+        for line in "${SOURCE_LINES[@]}"; do
             DS_NAMES+=("$(printf '%s' "${line}" | cut -f1)")
             DS_ENCS+=("$(printf '%s' "${line}" | cut -f2)")
         done
@@ -1178,12 +1178,12 @@ if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
         echo "#!/usr/bin/env bash"
         echo "# Syncoid replication commands for site: ${SITE_NAME}"
         echo "# Backup server:      ${BACKUP_USER}@${BACKUP_HOST}"
-        echo "# Production servers: ${PROD_SERVERS[*]}"
+        echo "# Source servers: ${SOURCE_SERVERS[*]}"
         echo "# Generated:          $(date '+%Y-%m-%d')"
         echo "#"
         if [[ "${PUSH_MODE}" == "true" ]]; then
-            echo "# Push mode: run each command on its respective production server as ${SEND_USER}."
-            echo "# Schedule via cron/systemd on each prod server so backups run when the machine is online."
+            echo "# Push mode: run each command on its respective source server as ${SEND_USER}."
+            echo "# Schedule via cron/systemd on each source server so backups run when the machine is online."
         else
             echo "# Run these commands on the backup server (${BACKUP_HOST})."
             echo "# Each command uses 'sudo -H -u ${REC_USER} bash -c ...' so it can be"
