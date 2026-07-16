@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.27
+# syncoidsetup.sh — v0.2.28
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all source servers.
 #
@@ -293,7 +293,10 @@ PUBKEY_B64=$(base64 -w0 "${KEY_PATH}.pub")
 
 # ── Sudo password (asked once, reused for all remote servers) ─────────────────
 _sudo_pass=""
-read -rsp "[PROMPT] Sudo password for remote servers (press Enter if passwordless): " _sudo_pass
+# '|| true': read returns non-zero on EOF (e.g. stdin </dev/null in a
+# non-interactive run) and set -e would silently kill the script here;
+# an empty password falls through to the passwordless-sudo path.
+read -rsp "[PROMPT] Sudo password for remote servers (press Enter if passwordless): " _sudo_pass || true
 echo ""
 SUDO_B64=$(printf '%s' "${_sudo_pass}" | base64 -w0)
 unset _sudo_pass
@@ -399,6 +402,9 @@ REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
 # shared from= would lock out every source server except the one it was probed against.
 # The BACKUP_IP env var overrides resolution and applies to all source servers.
 AUTH_ENTRY_B64=""  # rebuilt per host in the loop below (pull mode only)
+FROM_IP=""         # ditto — must be initialised: the source-server heredoc expands
+                   # ${FROM_IP} locally even in push mode (inside a remote branch that
+                   # is never taken), and set -u would abort on an unset variable
 
 # ── 4. Push public key to each source server via SSH ──────────────────────────
 for i in "${!SOURCE_SERVERS[@]}"; do
@@ -1023,7 +1029,18 @@ for i in "${!SOURCE_SERVERS[@]}"; do
 
     # Grant ZFS receive permissions on the selected destination parent only.
     # Child datasets inherit, so this covers all datasets replicated under it.
+    # Create the parent first if missing — 'zfs allow' fails on a nonexistent
+    # dataset, and the per-dataset pre-creation below would create it later
+    # anyway, leaving the grant silently skipped and every generated command
+    # failing at runtime with permission denied.
     echo "│"
+    if ! _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs list -H -o name "${LOCAL_PARENT}" > /dev/null 2>&1; then
+        if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" zfs create -p "${LOCAL_PARENT}" 2>/dev/null; then
+            echo "│  [OK] Created destination parent: ${LOCAL_PARENT}"
+        else
+            echo "│  [WARN] Could not create ${LOCAL_PARENT} — create it manually before running syncoid."
+        fi
+    fi
     if _ssh_sudo "${BACKUP_USER}@${BACKUP_HOST}" \
             zfs allow -u "${REC_USER}" receive,create,mount,rollback,destroy,compression "${LOCAL_PARENT}" 2>/dev/null; then
         echo "│  [OK] ZFS receive permissions granted to ${REC_USER} on ${LOCAL_PARENT}"
