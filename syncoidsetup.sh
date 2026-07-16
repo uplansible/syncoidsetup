@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.28
+# syncoidsetup.sh — v0.2.29
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all source servers.
 #
@@ -256,6 +256,7 @@ _ssh_sudo() {
     local conn="$1"; shift
     local cmd
     printf -v cmd '%q ' "$@"
+    # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64 and the %q-quoted command
     ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" bash -s << SUDOEOF
 set -euo pipefail
 _SUDO_B64="${SUDO_B64}"
@@ -306,6 +307,7 @@ echo ""
 echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
 
+# shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64, keys, usernames; remote vars are \$-escaped
 ssh -T "${SSH_CTL[@]}" "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
     2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
     << BACKUPEOF
@@ -438,6 +440,7 @@ for i in "${!SOURCE_SERVERS[@]}"; do
         AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
     fi
 
+    # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64, keys, from= entry; remote vars are \$-escaped
     ssh -T "${SSH_CTL[@]}" "${SOURCE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << SOURCEEOF
@@ -612,6 +615,7 @@ SOURCEEOF
         # from the backup server itself (the machine that will connect), so
         # it's the same TOFU trade-off as the rest of the setup.
         echo "[INFO] Seeding ${HOST}'s host key into ${REC_USER}'s known_hosts on ${BACKUP_HOST}..."
+        # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64 and host names; remote vars are \$-escaped
         ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << KNOWNHOSTSEOF
@@ -670,6 +674,7 @@ KNOWNHOSTSEOF
 
         # Deploy public key to recsyncoid's authorized_keys on the backup server
         echo "[INFO] Deploying public key to ${REC_USER}@${BACKUP_HOST} (from=${SOURCE_IP})..."
+        # shellcheck disable=SC2087 # client-side expansion is intentional: embeds SUDO_B64 and the from= auth entry; remote vars are \$-escaped
         ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << PUSHKEYEOF
