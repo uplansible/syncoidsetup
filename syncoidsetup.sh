@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syncoidsetup.sh — v0.2.30
+# syncoidsetup.sh — v0.2.32
 # Run on your MANAGEMENT machine (laptop/workstation) — NOT on the backup server.
 # Requires SSH access (with sudo rights) to both the backup server and all source servers.
 #
@@ -11,13 +11,20 @@
 # --push          Push mode: syncoid runs on each source server and pushes to the backup server.
 #                 Use when source servers are intermittently online (default: pull mode, backup pulls).
 # --password-auth Force password auth for admin SSH (no pubkey). Use when many keys in agent
-#                 cause 'too many authentication failures'.
+#                 cause 'too many authentication failures'. Applies to ALL servers.
+# --auth <method> Per-server auth override; must directly follow the --backup or --source it
+#                 applies to. 'password' = password-only auth for that server; any other
+#                 value = path to the ONLY identity file offered (IdentitiesOnly=yes, with
+#                 password fallback). Either form prevents a large ssh-agent keyring from
+#                 tripping the server's MaxAuthTries. Overrides --password-auth for that server.
 # --site   Optional. Defaults to the backup server's short hostname.
 # user@    Optional for both --backup and --source; defaults to $USER.
 #
 # Examples:
 #   ./syncoidsetup.sh --backup admin@100.64.0.10 --source ubuntu@100.64.0.1
 #   ./syncoidsetup.sh --push --backup ma@100.88.1.4 --source nobi@100.103.188.87
+#   ./syncoidsetup.sh --backup ma@100.88.1.4 --auth password \
+#                     --source nobi@100.103.188.87 --auth ~/.ssh/id_ed25519_nobi
 #   ./syncoidsetup.sh --site homelab --backup 100.64.0.10 \
 #                     --source ubuntu@100.64.0.1 --source root@100.64.0.2
 #
@@ -62,6 +69,9 @@ usage() {
     echo "                       Use when source servers are intermittently online."
     echo "       --password-auth Force password authentication for admin SSH connections (no public key)."
     echo "                       Use when you have many keys in your agent causing 'too many auth failures'."
+    echo "       --auth     Per-server auth override; must directly follow the --backup/--source it applies to."
+    echo "                  'password' = password-only auth; any other value = path to the only identity"
+    echo "                  file offered (IdentitiesOnly=yes). Overrides --password-auth for that server."
     echo "       --site     Optional. Site name for this backup set (defaults to the backup server's short hostname)."
     echo "       --backup   Backup server in [user@]host format (user defaults to \$USER)."
     echo "       --source   Source server(s) in [user@]host format (user defaults to \$USER). Repeatable."
@@ -77,6 +87,8 @@ SOURCE_SERVERS=()
 SOURCE_USERS=()
 PUSH_MODE=false
 PASSWORD_AUTH=false
+declare -A AUTH_BY_CONN=()  # per-server --auth override, keyed by admin@host
+_LAST_CONN=""               # admin@host of the most recent --backup/--source (for --auth)
 
 
 # Split [user@]host into _SPLIT_USER and _SPLIT_HOST; user defaults to $USER
@@ -102,12 +114,27 @@ while [[ $# -gt 0 ]]; do
             split_userhost "$2"
             BACKUP_USER="${_SPLIT_USER}"
             BACKUP_HOST="${_SPLIT_HOST}"
+            _LAST_CONN="${BACKUP_USER}@${BACKUP_HOST}"
             shift 2 ;;
         --source)
             [[ $# -ge 2 && "$2" != --* ]] || { echo "[ERROR] --source requires a [user@]host value." >&2; usage; }
             split_userhost "$2"
             SOURCE_USERS+=("${_SPLIT_USER}")
             SOURCE_SERVERS+=("${_SPLIT_HOST}")
+            _LAST_CONN="${_SPLIT_USER}@${_SPLIT_HOST}"
+            shift 2 ;;
+        --auth)
+            [[ $# -ge 2 && "$2" != --* ]] || { echo "[ERROR] --auth requires a value ('password' or a key file path)." >&2; usage; }
+            [[ -n "${_LAST_CONN}" ]] || { echo "[ERROR] --auth must directly follow the --backup or --source it applies to." >&2; usage; }
+            _AUTH_VAL="$2"
+            # Expand a leading ~/ that survived shell quoting (bracket expression
+            # keeps the tilde literal without tripping shellcheck SC2088)
+            [[ "${_AUTH_VAL}" == [~]/* ]] && _AUTH_VAL="${HOME}/${_AUTH_VAL:2}"
+            if [[ "${_AUTH_VAL}" != "password" && ! -r "${_AUTH_VAL}" ]]; then
+                echo "[ERROR] --auth key file '${_AUTH_VAL}' not found or not readable." >&2
+                exit 1
+            fi
+            AUTH_BY_CONN["${_LAST_CONN}"]="${_AUTH_VAL}"
             shift 2 ;;
         --push) PUSH_MODE=true; shift ;;
         --password-auth) PASSWORD_AUTH=true; shift ;;
@@ -229,17 +256,38 @@ if [[ "${PASSWORD_AUTH}" == "true" ]]; then
     SSH_CTL+=(-o PreferredAuthentications=password -o PubkeyAuthentication=no)
 fi
 
+# Per-server auth override (--auth): fills the AUTH_OPTS array for the given
+# admin@host. 'password' forces password-only auth; any other value is used as
+# the ONLY identity file (IdentitiesOnly=yes, password fallback), so a large
+# ssh-agent keyring cannot trip the server's MaxAuthTries. AUTH_OPTS is placed
+# BEFORE SSH_CTL in every ssh call: ssh keeps the first value obtained per
+# option, so a per-server override beats the global --password-auth options
+# baked into SSH_CTL. Empty (no override) for servers without --auth.
+AUTH_OPTS=()
+_auth_opts() {
+    local _m="${AUTH_BY_CONN[$1]:-}"
+    if [[ "${_m}" == "password" ]]; then
+        AUTH_OPTS=(-o PreferredAuthentications=password -o PubkeyAuthentication=no)
+    elif [[ -n "${_m}" ]]; then
+        AUTH_OPTS=(-o IdentitiesOnly=yes -o PubkeyAuthentication=yes
+                   -o "PreferredAuthentications=publickey,password" -i "${_m}")
+    else
+        AUTH_OPTS=()
+    fi
+}
+
 # Resolve the source IP <admin@host> uses for outbound traffic toward <target>.
 # Hostname targets are resolved to an IP on the remote side first — 'ip route get'
 # only accepts addresses, and resolving remotely respects the server's own DNS view.
 # Falls back to the default-route source IP, then 'hostname -I'. Prints nothing on failure.
 _resolve_outbound_ip() {
     local conn="$1" target="$2"
+    _auth_opts "${conn}"
     # Each step falls back only when the previous produced an *empty* result.
     # A bare 'cmd | awk || fallback' chain is wrong here: awk exits 0 even when
     # it prints nothing, so a successful 'ip route get' with no 'src' field would
     # swallow the fallback and return an empty string. Test emptiness explicitly.
-    ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" "
+    ssh -n "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" "
         _t=\$(getent ahosts '${target}' 2>/dev/null | awk '{print \$1; exit}')
         _ip=\$(ip route get \"\${_t:-${target}}\" 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}')
         [ -z \"\${_ip}\" ] && _ip=\$(ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if(\$i==\"src\"){print \$(i+1); exit}}')
@@ -257,8 +305,9 @@ _ssh_sudo() {
     local cmd _b64
     printf -v cmd '%q ' "$@"
     _b64="${SUDO_B64_BY_HOST[${conn}]:-}"
+    _auth_opts "${conn}"
     # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password and the %q-quoted command
-    ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" bash -s << SUDOEOF
+    ssh "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" bash -s << SUDOEOF
 set -euo pipefail
 _SUDO_B64="${_b64}"
 if [[ -n "\${_SUDO_B64}" ]]; then
@@ -306,11 +355,12 @@ declare -A SUDO_B64_BY_HOST
 # itself is tested, not a stale credential cache.
 _verify_sudo() {
     local conn="$1" b64="$2"
+    _auth_opts "${conn}"
     if [[ -n "${b64}" ]]; then
-        printf '%s\n' "${b64}" | ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" \
+        printf '%s\n' "${b64}" | ssh "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" \
             'IFS= read -r _b; printf "%s\n" "$(printf "%s" "${_b}" | base64 -d)" | sudo -S -p "" -k true 2>/dev/null'
     else
-        ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" 'sudo -n -k true 2>/dev/null'
+        ssh -n "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${conn}" 'sudo -n -k true 2>/dev/null'
     fi
 }
 
@@ -367,8 +417,9 @@ echo ""
 echo "[INFO] Setting up ${REC_USER} on backup server ${BACKUP_HOST} (connecting as ${BACKUP_USER})..."
 
 
+_auth_opts "${BACKUP_USER}@${BACKUP_HOST}"
 # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password, keys, usernames; remote vars are \$-escaped
-ssh -T "${SSH_CTL[@]}" "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
+ssh -T "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
     2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
     << BACKUPEOF
 set -euo pipefail
@@ -453,7 +504,8 @@ echo "[OK] ${REC_USER} hardened on \$(hostname)."
 BACKUPEOF
 
 # Fetch REC_HOME from backup server so we can reference the key path in generated commands
-REC_HOME=$(ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
+_auth_opts "${BACKUP_USER}@${BACKUP_HOST}"
+REC_HOME=$(ssh -n "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" \
     "getent passwd ${REC_USER} | cut -d: -f6")
 REC_SSH_DIR="${REC_HOME}/.ssh"
 REC_KEY_PATH="${REC_SSH_DIR}/id_ed25519_${SITE_NAME}_syncoid"
@@ -501,8 +553,9 @@ for i in "${!SOURCE_SERVERS[@]}"; do
         AUTH_ENTRY_B64=$(printf '%s' "${AUTH_ENTRY}" | base64 -w0)
     fi
 
+    _auth_opts "${SOURCE_ADMIN_USER}@${HOST}"
     # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password, keys, from= entry; remote vars are \$-escaped
-    ssh -T "${SSH_CTL[@]}" "${SOURCE_ADMIN_USER}@${HOST}" bash -s \
+    ssh -T "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" "${SOURCE_ADMIN_USER}@${HOST}" bash -s \
         2> >(sed "s/^/[${HOST}] /" >&2) \
         << SOURCEEOF
 set -euo pipefail
@@ -676,8 +729,9 @@ SOURCEEOF
         # from the backup server itself (the machine that will connect), so
         # it's the same TOFU trade-off as the rest of the setup.
         echo "[INFO] Seeding ${HOST}'s host key into ${REC_USER}'s known_hosts on ${BACKUP_HOST}..."
+        _auth_opts "${BACKUP_USER}@${BACKUP_HOST}"
         # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password and host names; remote vars are \$-escaped
-        ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
+        ssh "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << KNOWNHOSTSEOF
 set -euo pipefail
@@ -735,8 +789,9 @@ KNOWNHOSTSEOF
 
         # Deploy public key to recsyncoid's authorized_keys on the backup server
         echo "[INFO] Deploying public key to ${REC_USER}@${BACKUP_HOST} (from=${SOURCE_IP})..."
+        _auth_opts "${BACKUP_USER}@${BACKUP_HOST}"
         # shellcheck disable=SC2087 # client-side expansion is intentional: embeds the per-host sudo password and the from= auth entry; remote vars are \$-escaped
-        ssh "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
+        ssh "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${BACKUP_USER}@${BACKUP_HOST}" bash -s \
             2> >(sed "s/^/[${BACKUP_HOST}] /" >&2) \
             << PUSHKEYEOF
 set -euo pipefail
@@ -916,6 +971,10 @@ mapfile -t LOCAL_DATASETS < <(
 )
 
 ALL_CMDS=()  # accumulates all generated commands across hosts
+# Script fragments for the optional systemd-timer step, keyed by the admin
+# connection of the machine that will run them (pull: always the backup
+# server; push: each source server holds only its own commands).
+declare -A TIMER_CMDS_BY_CONN=()
 
 for i in "${!SOURCE_SERVERS[@]}"; do
     HOST="${SOURCE_SERVERS[$i]}"
@@ -927,7 +986,8 @@ for i in "${!SOURCE_SERVERS[@]}"; do
     # In push mode, resolve sendsyncoid's home on this source server to build the key path
     SEND_KEY_PATH=""
     if [[ "${PUSH_MODE}" == "true" ]]; then
-        _SEND_HOME=$(ssh -n "${SSH_CTL[@]}" -o ConnectTimeout=10 "${SOURCE_ADMIN_USER}@${HOST}" \
+        _auth_opts "${SOURCE_ADMIN_USER}@${HOST}"
+        _SEND_HOME=$(ssh -n "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${SOURCE_ADMIN_USER}@${HOST}" \
             "getent passwd '${SEND_USER}' | cut -d: -f6" 2>/dev/null || true)
         if [[ -z "${_SEND_HOME}" ]]; then
             echo "│ [WARN] Could not determine ${SEND_USER} home on ${HOST} — key path may be incorrect."
@@ -1231,6 +1291,19 @@ for i in "${!SOURCE_SERVERS[@]}"; do
     done
 
     ALL_CMDS+=("${HOST_CMDS[@]}")
+
+    # Collect this host's commands for the optional systemd-timer step.
+    # '|| rc=1' lets the installed script run every command and still exit
+    # non-zero if any of them failed, so systemd marks the run as failed.
+    if [[ "${PUSH_MODE}" == "true" ]]; then
+        _TIMER_CONN="${SOURCE_ADMIN_USER}@${HOST}"
+    else
+        _TIMER_CONN="${BACKUP_USER}@${BACKUP_HOST}"
+    fi
+    for cmd in "${HOST_CMDS[@]}"; do
+        TIMER_CMDS_BY_CONN["${_TIMER_CONN}"]+="${cmd} || rc=1"$'\n\n'
+    done
+
     echo "└──────────────────────────────────────────────────────────"
 done
 
@@ -1281,4 +1354,163 @@ if [[ ${#ALL_CMDS[@]} -gt 0 ]]; then
     chmod 700 "${INVENTORY_FILE}"   # contains server IPs/layout — owner-only
     echo ""
     echo "[OK] Commands saved to: ${INVENTORY_FILE}"
+
+    # ── 7. Optional systemd service + timer installation ──────────────────────
+    # Installs the generated commands as /usr/local/sbin/syncoid-<site>.sh plus
+    # a oneshot service and timer on each machine that runs them (pull: the
+    # backup server; push: every source server), then enables the timer.
+    if [[ "${PUSH_MODE}" == "true" ]]; then
+        TIMER_TARGET_DESC="each source server"
+    else
+        TIMER_TARGET_DESC="the backup server"
+    fi
+    echo ""
+    read -r -p "Install a systemd service + timer on ${TIMER_TARGET_DESC} to run these backups automatically? [y/N]: " INSTALL_TIMER || true
+    if [[ "${INSTALL_TIMER}" =~ ^[Yy] ]]; then
+        echo ""
+        echo "Schedule:"
+        echo "  1) Hourly"
+        echo "  2) Daily at a fixed time"
+        echo "  3) Every N hours"
+        if [[ "${PUSH_MODE}" == "true" ]]; then
+            echo "  4) On boot + every N hours (for machines that are not always on)"
+            echo "  5) Custom OnCalendar expression (see 'man systemd.time')"
+            SCHED_DEFAULT=4 SCHED_MAX=5
+        else
+            echo "  4) Custom OnCalendar expression (see 'man systemd.time')"
+            SCHED_DEFAULT=2 SCHED_MAX=4
+        fi
+        while :; do
+            read -r -p "Choice [${SCHED_DEFAULT}]: " SCHED_CHOICE || true
+            SCHED_CHOICE="${SCHED_CHOICE:-${SCHED_DEFAULT}}"
+            [[ "${SCHED_CHOICE}" =~ ^[0-9]$ ]] && (( SCHED_CHOICE >= 1 && SCHED_CHOICE <= SCHED_MAX )) && break
+            echo "[WARN] Enter a number between 1 and ${SCHED_MAX}."
+        done
+        # The push-mode menu shifts 'custom' to 5; normalize to a schedule kind
+        case "${SCHED_CHOICE}" in
+            1) SCHED_KIND="hourly" ;;
+            2) SCHED_KIND="daily" ;;
+            3) SCHED_KIND="nhours" ;;
+            4) [[ "${PUSH_MODE}" == "true" ]] && SCHED_KIND="monotonic" || SCHED_KIND="custom" ;;
+            5) SCHED_KIND="custom" ;;
+        esac
+
+        # Build the [Timer] section. Persistent=true makes calendar timers
+        # catch up on runs missed while the machine was off.
+        TIMER_SECTION=""
+        case "${SCHED_KIND}" in
+            hourly)
+                TIMER_SECTION="OnCalendar=hourly"$'\n'"Persistent=true" ;;
+            daily)
+                while :; do
+                    read -r -p "Time of day (24h HH:MM) [02:00]: " SCHED_TIME || true
+                    SCHED_TIME="${SCHED_TIME:-02:00}"
+                    [[ "${SCHED_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break
+                    echo "[WARN] Invalid time — use 24h HH:MM (e.g. 02:00 or 23:30)."
+                done
+                TIMER_SECTION="OnCalendar=*-*-* ${SCHED_TIME}:00"$'\n'"Persistent=true" ;;
+            nhours|monotonic)
+                while :; do
+                    read -r -p "Every how many hours? (1-24) [4]: " SCHED_N || true
+                    SCHED_N="${SCHED_N:-4}"
+                    [[ "${SCHED_N}" =~ ^[0-9]{1,2}$ ]] && (( SCHED_N >= 1 && SCHED_N <= 24 )) && break
+                    echo "[WARN] Enter a number between 1 and 24."
+                done
+                if [[ "${SCHED_KIND}" == "monotonic" ]]; then
+                    TIMER_SECTION="OnBootSec=2min"$'\n'"OnUnitActiveSec=${SCHED_N}h"
+                else
+                    TIMER_SECTION="OnCalendar=*-*-* 00/${SCHED_N}:00:00"$'\n'"Persistent=true"
+                fi ;;
+            custom)
+                # Validate on a target host — systemd-analyze knows the
+                # authoritative syntax. Charset-check first: the expression is
+                # embedded into a unit file line.
+                _VAL_CONN=""
+                for conn in "${!TIMER_CMDS_BY_CONN[@]}"; do _VAL_CONN="${conn}"; break; done
+                _SCHED_RE='^[A-Za-z0-9 *,:./@~-]+$'
+                while :; do
+                    read -r -p "OnCalendar expression (e.g. 'Mon..Fri 03:00'): " SCHED_EXPR || true
+                    [[ -n "${SCHED_EXPR}" ]] || { echo "[WARN] Empty expression."; continue; }
+                    [[ "${SCHED_EXPR}" =~ ${_SCHED_RE} ]] || { echo "[WARN] Expression contains unsupported characters."; continue; }
+                    _auth_opts "${_VAL_CONN}"
+                    _rc=0
+                    ssh -n "${AUTH_OPTS[@]}" "${SSH_CTL[@]}" -o ConnectTimeout=10 "${_VAL_CONN}" \
+                        "command -v systemd-analyze >/dev/null 2>&1 || exit 2; systemd-analyze calendar $(printf '%q' "${SCHED_EXPR}") >/dev/null 2>&1 || exit 1" || _rc=$?
+                    if [[ ${_rc} -eq 1 ]]; then
+                        echo "[WARN] '${SCHED_EXPR}' is not a valid OnCalendar expression (rejected by systemd-analyze on ${_VAL_CONN#*@})."
+                        continue
+                    elif [[ ${_rc} -ne 0 ]]; then
+                        echo "[WARN] Could not validate the expression remotely — installing it unvalidated."
+                    fi
+                    break
+                done
+                TIMER_SECTION="OnCalendar=${SCHED_EXPR}"$'\n'"Persistent=true" ;;
+        esac
+
+        TIMER_UNIT="syncoid-${SITE_NAME}"
+        TIMER_SCRIPT_PATH="/usr/local/sbin/${TIMER_UNIT}.sh"
+        for conn in "${!TIMER_CMDS_BY_CONN[@]}"; do
+            echo "[INFO] Installing ${TIMER_UNIT}.timer on ${conn#*@}..."
+            SCRIPT_BODY="#!/usr/bin/env bash
+# Syncoid replication for site ${SITE_NAME} — installed by syncoidsetup.sh
+# Generated: $(date '+%Y-%m-%d')
+# Runs this host's replication commands sequentially; exits non-zero if any
+# of them failed so systemd marks the run as failed.
+rc=0
+
+${TIMER_CMDS_BY_CONN[${conn}]}exit \${rc}
+"
+            SERVICE_BODY="[Unit]
+Description=Syncoid replication for site ${SITE_NAME}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TIMER_SCRIPT_PATH}
+"
+            TIMER_BODY="[Unit]
+Description=Syncoid replication timer for site ${SITE_NAME}
+
+[Timer]
+${TIMER_SECTION}
+
+[Install]
+WantedBy=timers.target
+"
+            _SCRIPT_B64=$(printf '%s' "${SCRIPT_BODY}" | base64 -w0)
+            _SERVICE_B64=$(printf '%s' "${SERVICE_BODY}" | base64 -w0)
+            _TIMER_B64=$(printf '%s' "${TIMER_BODY}" | base64 -w0)
+            # Content travels base64-encoded inside a single %q-quoted bash -c
+            # argument (via _ssh_sudo), so no remote-side quoting can break.
+            if _ssh_sudo "${conn}" bash -c "
+                set -euo pipefail
+                umask 077
+                _t=\$(mktemp)
+                printf '%s' '${_SCRIPT_B64}' | base64 -d > \"\${_t}\"
+                install -d -m 755 /usr/local/sbin
+                install -m 700 -o root -g root \"\${_t}\" '${TIMER_SCRIPT_PATH}'
+                printf '%s' '${_SERVICE_B64}' | base64 -d > \"\${_t}\"
+                install -m 644 -o root -g root \"\${_t}\" '/etc/systemd/system/${TIMER_UNIT}.service'
+                printf '%s' '${_TIMER_B64}' | base64 -d > \"\${_t}\"
+                install -m 644 -o root -g root \"\${_t}\" '/etc/systemd/system/${TIMER_UNIT}.timer'
+                rm -f \"\${_t}\"
+                systemctl daemon-reload
+                systemctl enable --now '${TIMER_UNIT}.timer'
+            "; then
+                echo "[OK] ${TIMER_UNIT}.timer enabled on ${conn#*@}"
+                echo "     Commands script:  ${TIMER_SCRIPT_PATH}"
+                echo "     Check schedule:   systemctl list-timers ${TIMER_UNIT}.timer"
+                echo "     Check last run:   journalctl -u ${TIMER_UNIT}.service"
+            else
+                echo "[WARN] Timer installation failed on ${conn#*@} — install manually:"
+                echo "       script: ${TIMER_SCRIPT_PATH} (commands are in ${INVENTORY_FILE})"
+                echo "       units:  /etc/systemd/system/${TIMER_UNIT}.{service,timer}"
+                echo "       then:   sudo systemctl daemon-reload && sudo systemctl enable --now ${TIMER_UNIT}.timer"
+            fi
+        done
+        if [[ "${SCHED_KIND}" == "monotonic" ]]; then
+            echo "[INFO] On-boot schedule: the first run starts within ~2 minutes of enabling the timer."
+        fi
+    fi
 fi
